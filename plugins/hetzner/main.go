@@ -1,23 +1,19 @@
 // launchpad-plugin-hetzner provisions VMs on Hetzner Cloud.
 //
 // Config (from launchpad, via plugin.initialize params.config):
-//   region: fallback for VMSpec.Region ("fsn1", "nbg1", "hel1", ...)
-//   image:  fallback for VMSpec.Image ("ubuntu-24.04", ...)
-//   size:   fallback for VMSpec.SizeHint ("cx22", "cpx31", ...)
+//
+//	region: fallback for VMSpec.Region ("fsn1", "nbg1", "hel1", ...)
+//	image:  fallback for VMSpec.Image ("ubuntu-24.04", ...)
+//	size:   fallback for VMSpec.SizeHint ("cx22", "cpx31", ...)
 //
 // Env:
-//   HCLOUD_TOKEN (required)
+//
+//	HCLOUD_TOKEN (required)
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -25,6 +21,8 @@ import (
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	sdk "github.com/soctalk/launchpad-sdk-go"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/cloudinit"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/tailscale"
 )
 
 const (
@@ -39,6 +37,10 @@ const (
 type plugin struct {
 	client *hcloud.Client
 	cfg    config
+	// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
+	// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
+	// the Network resource).
+	tsAPIKey string
 }
 
 type config struct {
@@ -49,14 +51,8 @@ type config struct {
 	TagPrefix string `json:"tag_prefix,omitempty"`
 }
 
-var p plugin
-
-// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
-// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
-// the Network resource).
-var tsAPIKey string
-
 func main() {
+	p := &plugin{}
 	err := sdk.Serve(sdk.Plugin{
 		Name:    name,
 		Version: version,
@@ -75,12 +71,12 @@ func main() {
 			"additionalProperties": false,
 		},
 
-		Initialize: initialize,
-		Plan:       plan,
-		Create:     create,
-		WaitReady:  waitReady,
-		Destroy:    destroy,
-		Inspect:    inspect,
+		Initialize: p.initialize,
+		Plan:       p.plan,
+		Create:     p.create,
+		WaitReady:  p.waitReady,
+		Destroy:    p.destroy,
+		Inspect:    p.inspect,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hetzner plugin:", err)
@@ -88,7 +84,7 @@ func main() {
 	}
 }
 
-func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
+func (p *plugin) initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
 	token := os.Getenv("HCLOUD_TOKEN")
 	if token == "" {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatAuth,
@@ -113,7 +109,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 
 	// Tailscale API key: injected per-run from the Network resource. Required to
 	// mint the ephemeral device auth key baked into the server's cloud-init.
-	tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
+	p.tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
 
 	p.client = hcloud.NewClient(hcloud.WithToken(token))
 	// Cheap ping: list images with limit=1. Confirms creds.
@@ -129,7 +125,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 }
 
 // resolveSpec merges spec defaults with plugin config fallbacks.
-func resolveSpec(spec *sdk.VMSpec) {
+func (p *plugin) resolveSpec(spec *sdk.VMSpec) {
 	if spec.Region == "" {
 		spec.Region = p.cfg.Region
 	}
@@ -141,10 +137,10 @@ func resolveSpec(spec *sdk.VMSpec) {
 	}
 }
 
-func plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
+func (p *plugin) plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
 	// plan can run in the compliance suite before Initialize; guard nil client.
 	spec := params.Spec
-	resolveSpec(&spec)
+	p.resolveSpec(&spec)
 	if err := validateSpec(spec); err != nil {
 		return sdk.VMPlanResult{}, err
 	}
@@ -177,7 +173,7 @@ func validateSpec(spec sdk.VMSpec) error {
 
 // requireClient returns a typed error if Initialize hasn't been called (or
 // failed). Every method that touches the API must call this first.
-func requireClient() error {
+func (p *plugin) requireClient() error {
 	if p.client == nil {
 		return sdk.Errf(sdk.CatAuth,
 			"hetzner.not_initialized",
@@ -187,7 +183,7 @@ func requireClient() error {
 }
 
 // findByLabels locates a server previously created for this (run_id, vm_key).
-func findByLabels(ctx context.Context, runID, vmKey string) (*hcloud.Server, error) {
+func (p *plugin) findByLabels(ctx context.Context, runID, vmKey string) (*hcloud.Server, error) {
 	selector := fmt.Sprintf("%s=%s,%s=%s", labelRunID, runID, labelVMKey, vmKey)
 	servers, err := p.client.Server.AllWithOpts(ctx, hcloud.ServerListOpts{
 		ListOpts: hcloud.ListOpts{LabelSelector: selector},
@@ -201,18 +197,18 @@ func findByLabels(ctx context.Context, runID, vmKey string) (*hcloud.Server, err
 	return servers[0], nil
 }
 
-func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 	spec := params.Spec
-	resolveSpec(&spec)
+	p.resolveSpec(&spec)
 	if err := validateSpec(spec); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 	emit.Progress("lookup", 5, "checking for existing VM")
 	// Idempotent hit: return existing.
-	if existing, err := findByLabels(ctx, spec.RunID, spec.VMKey); err != nil {
+	if existing, err := p.findByLabels(ctx, spec.RunID, spec.VMKey); err != nil {
 		return sdk.VMCreateResult{}, sdk.Errf(sdk.CatInternal,
 			"hetzner.list_failed", "listing existing servers: %v", err)
 	} else if existing != nil {
@@ -244,7 +240,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// SSH keys.
 	var sshKeys []*hcloud.SSHKey
 	for _, pub := range spec.SSHKeys {
-		key, err := ensureSSHKey(ctx, spec.RunID, pub)
+		key, err := p.ensureSSHKey(ctx, spec.RunID, pub)
 		if err != nil {
 			return sdk.VMCreateResult{}, err
 		}
@@ -265,14 +261,14 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// resolves this server by its tailnet hostname (lp-<vmKey>). Hetzner takes
 	// raw cloud-config user-data (no base64).
 	emit.Progress("tailscale", 15, "minting device auth key")
-	tag := tailscaleTagForSpec(spec)
-	tskey, err := mintTailscaleKey(ctx, p.cfg.Tailnet, tag)
+	tag := tailscale.TagForSpec(spec, p.cfg.TagPrefix)
+	tskey, err := tailscale.MintKey(ctx, p.cfg.Tailnet, tag)
 	if err != nil {
 		return sdk.VMCreateResult{}, err
 	}
-	userData := composeUserData(cloudInitInputs{
-		Hostname:      hostnameFor(spec.VMKey),
-		SSHKeys:       mergeSSHKeys(nil, spec.SSHKeys),
+	userData := cloudinit.Compose(cloudinit.Inputs{
+		Hostname:      tailscale.Hostname(spec.VMKey),
+		SSHKeys:       cloudinit.MergeSSHKeys(nil, spec.SSHKeys),
 		TailscaleKey:  tskey,
 		TailscaleTag:  tag,
 		ExtraUserData: spec.UserData,
@@ -294,7 +290,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 		// allocate in; a capacity mismatch surfaces as an opaque "unsupported
 		// location for server type". Turn it into actionable guidance.
 		if strings.Contains(err.Error(), "unsupported location") {
-			if locs := availableLocationsFor(ctx, st); len(locs) > 0 {
+			if locs := p.availableLocationsFor(ctx, st); len(locs) > 0 {
 				return sdk.VMCreateResult{}, sdk.Errf(sdk.CatProviderUnavailable,
 					"hetzner.location.unavailable",
 					"server type %s is not available in location %q; currently available in: %s",
@@ -308,7 +304,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// Wait for the create action to complete (server allocated + started).
 	if res.Action != nil {
 		emit.Progress("create", 60, "waiting for boot")
-		if err := waitAction(ctx, res.Action, 5*time.Minute); err != nil {
+		if err := p.waitAction(ctx, res.Action, 5*time.Minute); err != nil {
 			return sdk.VMCreateResult{}, sdk.Errf(sdk.CatTimeout,
 				"hetzner.action.create_timeout", "%v", err)
 		}
@@ -323,8 +319,8 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	return serverToCreateResult(fresh), nil
 }
 
-func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMWaitReadyResult{}, err
 	}
 	// Hetzner reports "running" via server status; we don't SSH-probe in v1.
@@ -351,8 +347,8 @@ func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitt
 		"hetzner.wait_ready.timeout", "server did not reach running within 20m")
 }
 
-func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMDestroyResult{}, err
 	}
 	var server *hcloud.Server
@@ -366,7 +362,7 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	}
 	if server == nil {
 		// Fall back to label lookup (idempotent cleanup after state loss).
-		s, err := findByLabels(ctx, params.RunID, params.VMKey)
+		s, err := p.findByLabels(ctx, params.RunID, params.VMKey)
 		if err != nil {
 			return sdk.VMDestroyResult{}, sdk.Errf(sdk.CatInternal,
 				"hetzner.list_failed", "%v", err)
@@ -385,8 +381,8 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	return sdk.VMDestroyResult{Destroyed: true}, nil
 }
 
-func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMInspectResult{}, err
 	}
 	var server *hcloud.Server
@@ -398,7 +394,7 @@ func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) 
 		server = s
 	}
 	if server == nil {
-		s, err := findByLabels(ctx, params.RunID, params.VMKey)
+		s, err := p.findByLabels(ctx, params.RunID, params.VMKey)
 		if err != nil {
 			return sdk.VMInspectResult{}, err
 		}
@@ -423,17 +419,11 @@ func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) 
 
 func serverToCreateResult(server *hcloud.Server) sdk.VMCreateResult {
 	return sdk.VMCreateResult{
-		VMID:        fmt.Sprintf("%d", server.ID),
-		IPv4:        ipv4Of(server),
-		IPv6:        ipv6Of(server),
-		SSHUser:     "root",
-		SSHPort:     22,
-		ProviderURL: fmt.Sprintf("https://console.hetzner.cloud/projects/-/servers/%d", server.ID),
-		Metadata: map[string]string{
-			"provider":       "hetzner",
-			"datacenter":     dcName(server),
-			"server_type":    stName(server),
-		},
+		VMID:    fmt.Sprintf("%d", server.ID),
+		IPv4:    ipv4Of(server),
+		IPv6:    ipv6Of(server),
+		SSHUser: "root",
+		SSHPort: 22,
 	}
 }
 
@@ -481,7 +471,7 @@ func mapServerStatus(s hcloud.ServerStatus) string {
 // can currently be created. Hetzner's datacenters endpoint (ServerTypes.Available)
 // is the real availability signal — a type may be priced in a location yet be out
 // of capacity there.
-func availableLocationsFor(ctx context.Context, st *hcloud.ServerType) []string {
+func (p *plugin) availableLocationsFor(ctx context.Context, st *hcloud.ServerType) []string {
 	if st == nil {
 		return nil
 	}
@@ -541,7 +531,7 @@ func mustParseID(s string) int64 {
 	return id
 }
 
-func waitAction(ctx context.Context, action *hcloud.Action, timeout time.Duration) error {
+func (p *plugin) waitAction(ctx context.Context, action *hcloud.Action, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if action.Status == hcloud.ActionStatusSuccess {
@@ -568,7 +558,7 @@ func waitAction(ctx context.Context, action *hcloud.Action, timeout time.Duratio
 }
 
 // ensureSSHKey uploads a public key if not present, returns the hcloud key.
-func ensureSSHKey(ctx context.Context, runID, pub string) (*hcloud.SSHKey, error) {
+func (p *plugin) ensureSSHKey(ctx context.Context, runID, pub string) (*hcloud.SSHKey, error) {
 	// Look up by content fingerprint via label — cheapest approach.
 	pub = strings.TrimSpace(pub)
 	// Hetzner accepts direct SSH key content in the create call, but requires
@@ -607,155 +597,4 @@ func sanitizeLabelKey(k string) string {
 		k = k[:63]
 	}
 	return k
-}
-
-// --- Tailscale join + cloud-init composition -------------------------------
-// Ported from the qemu-family and aws plugins: cloud VMs join the tailnet on
-// first boot via a plugin-minted ephemeral auth key baked into cloud-init. The
-// orchestrator discovers each VM by its tailnet hostname (lp-<vmKey>) rather
-// than a public IP.
-
-type cloudInitInputs struct {
-	Hostname      string
-	SSHKeys       []string
-	TailscaleKey  string
-	TailscaleTag  string
-	ExtraUserData string
-}
-
-// composeUserData builds a #cloud-config that provisions the ops user, installs
-// Tailscale, and joins the tailnet with the minted auth key.
-func composeUserData(in cloudInitInputs) string {
-	var b bytes.Buffer
-	b.WriteString("#cloud-config\n")
-	fmt.Fprintf(&b, "hostname: %s\n", in.Hostname)
-	b.WriteString("manage_etc_hosts: true\n")
-	b.WriteString("users:\n")
-	b.WriteString("  - default\n")
-	b.WriteString("  - name: ops\n")
-	b.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
-	b.WriteString("    shell: /bin/bash\n")
-	if len(in.SSHKeys) > 0 {
-		b.WriteString("    ssh_authorized_keys:\n")
-		for _, k := range in.SSHKeys {
-			fmt.Fprintf(&b, "      - %s\n", k)
-		}
-	}
-	b.WriteString("package_update: true\n")
-	b.WriteString("packages: [curl, ca-certificates, jq]\n")
-	b.WriteString("runcmd:\n")
-	b.WriteString("  - curl -fsSL https://tailscale.com/install.sh | sh\n")
-	fmt.Fprintf(&b,
-		"  - tailscale up --auth-key=%q --advertise-tags=%s --hostname=%s\n",
-		in.TailscaleKey, in.TailscaleTag, in.Hostname)
-	if in.ExtraUserData != "" {
-		for _, line := range strings.Split(strings.TrimSpace(in.ExtraUserData), "\n") {
-			fmt.Fprintf(&b, "  - %s\n", line)
-		}
-	}
-	return b.String()
-}
-
-// mintTailscaleKey creates a single-use, ephemeral, pre-authorized device auth
-// key tagged for this VM. Requires TAILSCALE_API_KEY (tsAPIKey).
-func mintTailscaleKey(ctx context.Context, tailnet, tag string) (string, error) {
-	if tailnet == "" {
-		return "", sdk.Errf(sdk.CatValidation, "hetzner.tailscale.no_tailnet", "tailnet is empty")
-	}
-	if tsAPIKey == "" {
-		return "", sdk.Errf(sdk.CatAuth, "hetzner.tailscale.no_api_key",
-			"TAILSCALE_API_KEY is required for minting device auth keys")
-	}
-	payload := map[string]any{
-		"capabilities": map[string]any{
-			"devices": map[string]any{
-				"create": map[string]any{
-					"reusable":      false,
-					"ephemeral":     true,
-					"preauthorized": true,
-					"tags":          []string{tag},
-				},
-			},
-		},
-		"expirySeconds": 3600,
-	}
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/keys", tailnet)
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(tsAPIKey, "")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", sdk.Errf(sdk.CatProviderUnavailable, "hetzner.tailscale.api_error", "%v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", sdk.Errf(sdk.CatAuth, "hetzner.tailscale.api_status",
-			"tailscale API %d: %s", resp.StatusCode, string(raw))
-	}
-	var out struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", err
-	}
-	if out.Key == "" {
-		return "", sdk.Errf(sdk.CatInternal, "hetzner.tailscale.key_missing",
-			"no key in tailscale response: %s", string(raw))
-	}
-	return out.Key, nil
-}
-
-// tailscaleTagForSpec derives the advertised tag from the VM role/slug so the
-// tailnet ACL can group MSSP and tenant devices. Matches the qemu/vmware/aws
-// plugins.
-func tailscaleTagForSpec(spec sdk.VMSpec) string {
-	prefix := p.cfg.TagPrefix
-	role := spec.Tags["role"]
-	slug := spec.Tags["tenant_slug"]
-	if role == "mssp" {
-		return "tag:" + prefix + "mssp"
-	}
-	if role == "tenant" && slug != "" {
-		return "tag:" + prefix + "tenant-" + slug
-	}
-	return "tag:" + prefix + "lp-" + spec.VMKey
-}
-
-func hostnameFor(vmKey string) string {
-	return "lp-" + sanitizeHostname(vmKey)
-}
-
-func sanitizeHostname(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 40 {
-		out = out[:40]
-	}
-	if out == "" {
-		buf := make([]byte, 4)
-		_, _ = rand.Read(buf)
-		out = "lp-" + hex.EncodeToString(buf)
-	}
-	return out
-}
-
-func mergeSSHKeys(a, b []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(a)+len(b))
-	for _, k := range append(append([]string{}, a...), b...) {
-		if k = strings.TrimSpace(k); k != "" && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	return out
 }

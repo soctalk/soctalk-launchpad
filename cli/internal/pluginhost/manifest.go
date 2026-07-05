@@ -57,20 +57,6 @@ func AllowUnsigned() bool {
 	return os.Getenv("LAUNCHPAD_ALLOW_UNSIGNED") == "1" || os.Getenv("LAUNCHPAD_DEV") == "1"
 }
 
-// Trusted returns the subset of manifests permitted for secret-bearing flows
-// (provisioning, the UI, host probes). Managed plugins always qualify; dev
-// plugins qualify only when AllowUnsigned() is set.
-func Trusted(ms []*Manifest) []*Manifest {
-	allow := AllowUnsigned()
-	out := make([]*Manifest, 0, len(ms))
-	for _, m := range ms {
-		if m.Provenance == ProvenanceManaged || allow {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
 // AbsExecutable returns the absolute path to the plugin binary, joining
 // the manifest's Dir with its Executable field. The result is canonicalized.
 func (m *Manifest) AbsExecutable() string {

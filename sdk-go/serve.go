@@ -27,13 +27,13 @@ type Plugin struct {
 	AllowedEnvVars []string
 
 	// Handlers.
-	Initialize   func(ctx context.Context, params InitializeParams) (InitializeResult, error)
-	Plan         func(ctx context.Context, params VMPlanParams, emit Emitter) (VMPlanResult, error)
-	Create       func(ctx context.Context, params VMCreateParams, emit Emitter) (VMCreateResult, error)
-	WaitReady    func(ctx context.Context, params VMWaitReadyParams, emit Emitter) (VMWaitReadyResult, error)
-	Destroy      func(ctx context.Context, params VMDestroyParams, emit Emitter) (VMDestroyResult, error)
-	Inspect      func(ctx context.Context, params VMInspectParams, emit Emitter) (VMInspectResult, error)
-	Shutdown     func(ctx context.Context) error
+	Initialize func(ctx context.Context, params InitializeParams) (InitializeResult, error)
+	Plan       func(ctx context.Context, params VMPlanParams, emit Emitter) (VMPlanResult, error)
+	Create     func(ctx context.Context, params VMCreateParams, emit Emitter) (VMCreateResult, error)
+	WaitReady  func(ctx context.Context, params VMWaitReadyParams, emit Emitter) (VMWaitReadyResult, error)
+	Destroy    func(ctx context.Context, params VMDestroyParams, emit Emitter) (VMDestroyResult, error)
+	Inspect    func(ctx context.Context, params VMInspectParams, emit Emitter) (VMInspectResult, error)
+	Shutdown   func(ctx context.Context) error
 }
 
 // Emitter is the progress+log channel a handler can use during long-running
@@ -71,10 +71,10 @@ func (e *serverEmitter) Log(level, message string, fields map[string]any) {
 }
 
 // Serve runs the plugin's main loop. It:
-//   1. Emits plugin.hello on start.
-//   2. Reads requests from stdin, dispatches to the handler, writes responses.
-//   3. Handles plugin.shutdown gracefully.
-//   4. Returns nil on clean shutdown, error on protocol violation.
+//  1. Emits plugin.hello on start.
+//  2. Reads requests from stdin, dispatches to the handler, writes responses.
+//  3. Handles plugin.shutdown gracefully.
+//  4. Returns nil on clean shutdown, error on protocol violation.
 //
 // Serve is the intended entry point for a plugin's main() function.
 //

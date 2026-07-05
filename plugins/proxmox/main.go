@@ -9,24 +9,23 @@
 // snippet on the storage the cluster designates for snippets.
 //
 // Config (from launchpad):
-//   endpoint:  https://pve.example:8006
-//   node:      pve1 (which cluster node to target)
-//   storage:   local-lvm (VM disk storage)
-//   snippets:  local  (storage that accepts type "snippets")
-//   template:  9000  (VM ID of a cloud-init-ready template to clone)
-//   bridge:    vmbr0 (default network bridge)
+//
+//	endpoint:  https://pve.example:8006
+//	node:      pve1 (which cluster node to target)
+//	storage:   local-lvm (VM disk storage)
+//	snippets:  local  (storage that accepts type "snippets")
+//	template:  9000  (VM ID of a cloud-init-ready template to clone)
+//	bridge:    vmbr0 (default network bridge)
 //
 // Env:
-//   PROXMOX_API_TOKEN_ID     e.g. root@pam!launchpad
-//   PROXMOX_API_TOKEN_SECRET the token secret
+//
+//	PROXMOX_API_TOKEN_ID     e.g. root@pam!launchpad
+//	PROXMOX_API_TOKEN_SECRET the token secret
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,7 +36,9 @@ import (
 	"time"
 
 	sdk "github.com/soctalk/launchpad-sdk-go"
-	"golang.org/x/crypto/ssh"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/cloudinit"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/sshhost"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/tailscale"
 )
 
 const (
@@ -63,20 +64,23 @@ type config struct {
 	SnippetsDir string `json:"snippets_dir,omitempty"` // default /var/lib/vz/snippets
 }
 
-// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
-// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
-// the Network resource).
-var tsAPIKey string
-
 type client struct {
-	cfg   config
-	http  *http.Client
-	auth  string // "PVEAPIToken=<id>=<secret>"
+	cfg  config
+	http *http.Client
+	auth string // "PVEAPIToken=<id>=<secret>"
 }
 
-var pveClient *client
+// provider holds the plugin's mutable state, populated by initialize.
+type provider struct {
+	// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
+	// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
+	// the Network resource).
+	tsAPIKey  string
+	pveClient *client
+}
 
 func main() {
+	p := &provider{}
 	err := sdk.Serve(sdk.Plugin{
 		Name:    name,
 		Version: version,
@@ -102,12 +106,12 @@ func main() {
 			"additionalProperties": false,
 		},
 
-		Initialize: initialize,
-		Plan:       plan,
-		Create:     create,
-		WaitReady:  waitReady,
-		Destroy:    destroy,
-		Inspect:    inspect,
+		Initialize: p.initialize,
+		Plan:       p.plan,
+		Create:     p.create,
+		WaitReady:  p.waitReady,
+		Destroy:    p.destroy,
+		Inspect:    p.inspect,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "proxmox plugin:", err)
@@ -115,7 +119,7 @@ func main() {
 	}
 }
 
-func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
+func (p *provider) initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
 	id, secret := os.Getenv("PROXMOX_API_TOKEN_ID"), os.Getenv("PROXMOX_API_TOKEN_SECRET")
 	if id == "" || secret == "" {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatAuth,
@@ -146,7 +150,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 	}
 	// Tailscale API key: injected per-run from the Network resource. Required to
 	// mint the ephemeral device auth key baked into the VM's cloud-init.
-	tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
+	p.tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
 	if c.cfg.Endpoint == "" {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatValidation,
 			"proxmox.config.missing_endpoint", "config.endpoint is required")
@@ -157,28 +161,28 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 			"proxmox.api.probe_failed",
 			"Proxmox API probe failed: %v", err)
 	}
-	pveClient = c
+	p.pveClient = c
 	return sdk.InitializeResult{Ready: true}, nil
 }
 
-func requireClient() error {
-	if pveClient == nil {
+func (p *provider) requireClient() error {
+	if p.pveClient == nil {
 		return sdk.Errf(sdk.CatAuth, "proxmox.not_initialized",
 			"plugin.initialize has not been called successfully")
 	}
 	return nil
 }
 
-func plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
+func (p *provider) plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
 	return sdk.VMPlanResult{
-		Summary:              fmt.Sprintf("proxmox: clone template on node %s", pluginNodeOrPlaceholder()),
+		Summary:              fmt.Sprintf("proxmox: clone template on node %s", p.pluginNodeOrPlaceholder()),
 		EstimatedDurationSec: 120,
 	}, nil
 }
 
-func pluginNodeOrPlaceholder() string {
-	if pveClient != nil {
-		return pveClient.cfg.Node
+func (p *provider) pluginNodeOrPlaceholder() string {
+	if p.pveClient != nil {
+		return p.pveClient.cfg.Node
 	}
 	return "<node>"
 }
@@ -196,13 +200,13 @@ func vmidForKey(runID, vmKey string) int {
 	return 10000 + (sum % 50000)
 }
 
-func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
-	if err := requireClient(); err != nil {
+func (p *provider) create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 	spec := params.Spec
 	vmid := vmidForKey(spec.RunID, spec.VMKey)
-	c := pveClient
+	c := p.pveClient
 
 	// If vmid exists already, reuse (idempotent).
 	emit.Progress("lookup", 5, fmt.Sprintf("checking for existing vmid=%d", vmid))
@@ -243,14 +247,14 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// Tailscale and joins the tailnet on first boot. The orchestrator then
 	// resolves this VM by its tailnet hostname (lp-<vmKey>).
 	emit.Progress("tailscale", 50, "minting device auth key")
-	tag := tailscaleTagForSpec(spec)
-	tskey, err := mintTailscaleKey(ctx, c.cfg.Tailnet, tag)
+	tag := tailscale.TagForSpec(spec, p.pveClient.cfg.TagPrefix)
+	tskey, err := tailscale.MintKey(ctx, c.cfg.Tailnet, tag)
 	if err != nil {
 		return sdk.VMCreateResult{}, err
 	}
-	ud := composeUserData(cloudInitInputs{
-		Hostname:      hostnameFor(spec.VMKey),
-		SSHKeys:       mergeSSHKeys(nil, spec.SSHKeys),
+	ud := cloudinit.Compose(cloudinit.Inputs{
+		Hostname:      tailscale.Hostname(spec.VMKey),
+		SSHKeys:       cloudinit.MergeSSHKeys(nil, spec.SSHKeys),
 		TailscaleKey:  tskey,
 		TailscaleTag:  tag,
 		ExtraUserData: spec.UserData,
@@ -273,13 +277,13 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	return c.buildCreateResult(ctx, vmid, spec)
 }
 
-func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
-	if err := requireClient(); err != nil {
+func (p *provider) waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMWaitReadyResult{}, err
 	}
 	// Deeper cloud-init readiness is deferred to the launchpad's SSH probe.
 	// Here we just check qemu status transitions to "running".
-	c := pveClient
+	c := p.pveClient
 	deadline := time.Now().Add(20 * time.Minute)
 	for time.Now().Before(deadline) {
 		body, err := c.get(ctx, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s/status/current", c.cfg.Node, params.VMID))
@@ -299,11 +303,11 @@ func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitt
 		"proxmox.wait_ready.timeout", "VM did not reach running within 20m")
 }
 
-func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
-	if err := requireClient(); err != nil {
+func (p *provider) destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMDestroyResult{}, err
 	}
-	c := pveClient
+	c := p.pveClient
 	vmid := 0
 	if params.VMID != "" {
 		fmt.Sscanf(params.VMID, "%d", &vmid)
@@ -324,11 +328,11 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	return sdk.VMDestroyResult{Destroyed: true}, nil
 }
 
-func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
-	if err := requireClient(); err != nil {
+func (p *provider) inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMInspectResult{}, err
 	}
-	c := pveClient
+	c := p.pveClient
 	vmid := 0
 	if params.VMID != "" {
 		fmt.Sscanf(params.VMID, "%d", &vmid)
@@ -425,106 +429,6 @@ func (c *client) do(req *http.Request) ([]byte, error) {
 	return b, nil
 }
 
-// ------------------------------------------------------------------
-// SSH helpers (agent-based auth via SSH_AUTH_SOCK). Copied verbatim from
-// the qemu plugin: cloud-init snippets must be written to the PVE node's
-// filesystem, which the PVE API does not permit.
-// ------------------------------------------------------------------
-
-func dialSSH(userHost string, port int) (*ssh.Client, error) {
-	user := "root"
-	host := userHost
-	if i := strings.IndexByte(userHost, '@'); i >= 0 {
-		user, host = userHost[:i], userHost[i+1:]
-	}
-	if port == 0 {
-		port = 22
-	}
-	// Rely on the operator's ssh-agent for authentication. Explicit
-	// credential handling is out of scope for the plugin.
-	// (Callers should have SSH_AUTH_SOCK populated.)
-	sock := os.Getenv("SSH_AUTH_SOCK")
-	if sock == "" {
-		return nil, fmt.Errorf("SSH_AUTH_SOCK is not set; add key with `ssh-add` first")
-	}
-	agentConn, err := netDial("unix", sock)
-	if err != nil {
-		return nil, fmt.Errorf("dial ssh-agent: %w", err)
-	}
-	agentCli := newAgentClient(agentConn)
-	signers, err := agentCli.Signers()
-	if err != nil {
-		return nil, fmt.Errorf("ssh-agent signers: %w", err)
-	}
-	cfg := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signers...)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
-	}
-	return ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, port), cfg)
-}
-
-// runOverSSH runs a command on the remote host and returns its combined output.
-func runOverSSH(ctx context.Context, c *ssh.Client, cmd string) (string, error) {
-	sess, err := c.NewSession()
-	if err != nil {
-		return "", err
-	}
-	defer sess.Close()
-	// Wire stdin/stdout/stderr into a single buffer.
-	var buf bytes.Buffer
-	sess.Stdout = &buf
-	sess.Stderr = &buf
-	done := make(chan error, 1)
-	go func() {
-		done <- sess.Run(cmd)
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return buf.String(), fmt.Errorf("%s: %w: %s", cmd, err, buf.String())
-		}
-		return buf.String(), nil
-	case <-ctx.Done():
-		_ = sess.Close()
-		return "", ctx.Err()
-	}
-}
-
-// writeRemoteFile writes content to a remote path by running `cat > path`.
-// Simpler than sftp; adequate for user-data snippets and similar.
-func writeRemoteFile(c *ssh.Client, path string, content []byte) error {
-	sess, err := c.NewSession()
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-	stdin, err := sess.StdinPipe()
-	if err != nil {
-		return err
-	}
-	cmd := "cat > " + shellEscape(path)
-	if err := sess.Start(cmd); err != nil {
-		return err
-	}
-	if _, err := stdin.Write(content); err != nil {
-		return err
-	}
-	if err := stdin.Close(); err != nil {
-		return err
-	}
-	return sess.Wait()
-}
-
-func shellEscape(s string) string {
-	if !strings.ContainsAny(s, " '\"$\\`&|;<>*()[]{}?!#~") {
-		return s
-	}
-	// Wrap in single quotes; escape inner single quotes with '\''.
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
 func (c *client) writeUserDataSnippet(ctx context.Context, vmid int, userData string) error {
 	// Proxmox's storage upload API rejects content type "snippets" (it only
 	// accepts iso/vztmpl/import), so the snippet file cannot be POSTed to the
@@ -543,7 +447,7 @@ func (c *client) writeUserDataSnippet(ctx context.Context, vmid int, userData st
 	}
 
 	// Write the snippet to the node's snippets dir over SSH.
-	cli, err := dialSSH(c.cfg.SSHHost, c.cfg.SSHPort)
+	cli, err := sshhost.Dial(c.cfg.SSHHost, c.cfg.SSHPort)
 	if err != nil {
 		return sdk.Errf(sdk.CatProviderUnavailable,
 			"proxmox.ssh.unreachable",
@@ -558,11 +462,11 @@ func (c *client) writeUserDataSnippet(ctx context.Context, vmid int, userData st
 	filename := fmt.Sprintf("lp-%d-user.yaml", vmid)
 	remotePath := strings.TrimRight(snippetsDir, "/") + "/" + filename
 
-	if _, err := runOverSSH(ctx, cli, "mkdir -p "+shellEscape(snippetsDir)); err != nil {
+	if _, err := sshhost.Run(ctx, cli, "mkdir -p "+sshhost.ShellEscape(snippetsDir)); err != nil {
 		return sdk.Errf(sdk.CatProviderUnavailable,
 			"proxmox.snippet_write_failed", "cannot create snippets dir %s: %v", snippetsDir, err)
 	}
-	if err := writeRemoteFile(cli, remotePath, []byte(userData)); err != nil {
+	if err := sshhost.WriteFile(cli, remotePath, []byte(userData)); err != nil {
 		return sdk.Errf(sdk.CatProviderUnavailable,
 			"proxmox.snippet_write_failed", "cannot write snippet %s: %v", remotePath, err)
 	}
@@ -580,167 +484,10 @@ func (c *client) buildCreateResult(ctx context.Context, vmid int, spec sdk.VMSpe
 	// step is expected to do its own IP discovery via cloud-init metadata or
 	// SSH-bootstrap. IPv4 stays empty here.
 	return sdk.VMCreateResult{
-		VMID:        fmt.Sprint(vmid),
-		SSHUser:     "ops",
-		SSHPort:     22,
-		ProviderURL: fmt.Sprintf("%s#v1:0:=qemu%%2F%d", c.cfg.Endpoint, vmid),
-		Metadata: map[string]string{
-			"provider": "proxmox",
-			"node":     c.cfg.Node,
-		},
+		VMID:    fmt.Sprint(vmid),
+		SSHUser: "ops",
+		SSHPort: 22,
 	}, nil
-}
-
-// --- Tailscale join + cloud-init composition -------------------------------
-// Ported from the qemu-family plugins: cloud VMs join the tailnet on first boot
-// via a plugin-minted ephemeral auth key baked into cloud-init. The orchestrator
-// discovers each VM by its tailnet hostname (lp-<vmKey>) rather than a public IP.
-
-type cloudInitInputs struct {
-	Hostname      string
-	SSHKeys       []string
-	TailscaleKey  string
-	TailscaleTag  string
-	ExtraUserData string
-}
-
-// composeUserData builds a #cloud-config that provisions the ops user, installs
-// Tailscale, and joins the tailnet with the minted auth key.
-func composeUserData(in cloudInitInputs) string {
-	var b bytes.Buffer
-	b.WriteString("#cloud-config\n")
-	fmt.Fprintf(&b, "hostname: %s\n", in.Hostname)
-	b.WriteString("manage_etc_hosts: true\n")
-	b.WriteString("users:\n")
-	b.WriteString("  - default\n")
-	b.WriteString("  - name: ops\n")
-	b.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
-	b.WriteString("    shell: /bin/bash\n")
-	if len(in.SSHKeys) > 0 {
-		b.WriteString("    ssh_authorized_keys:\n")
-		for _, k := range in.SSHKeys {
-			fmt.Fprintf(&b, "      - %s\n", k)
-		}
-	}
-	b.WriteString("package_update: true\n")
-	b.WriteString("packages: [curl, ca-certificates, jq]\n")
-	b.WriteString("runcmd:\n")
-	b.WriteString("  - curl -fsSL https://tailscale.com/install.sh | sh\n")
-	fmt.Fprintf(&b,
-		"  - tailscale up --auth-key=%q --advertise-tags=%s --hostname=%s\n",
-		in.TailscaleKey, in.TailscaleTag, in.Hostname)
-	if in.ExtraUserData != "" {
-		for _, line := range strings.Split(strings.TrimSpace(in.ExtraUserData), "\n") {
-			fmt.Fprintf(&b, "  - %s\n", line)
-		}
-	}
-	return b.String()
-}
-
-// mintTailscaleKey creates a single-use, ephemeral, pre-authorized device auth
-// key tagged for this VM. Requires TAILSCALE_API_KEY (tsAPIKey).
-func mintTailscaleKey(ctx context.Context, tailnet, tag string) (string, error) {
-	if tailnet == "" {
-		return "", sdk.Errf(sdk.CatValidation, "proxmox.tailscale.no_tailnet", "tailnet is empty")
-	}
-	if tsAPIKey == "" {
-		return "", sdk.Errf(sdk.CatAuth, "proxmox.tailscale.no_api_key",
-			"TAILSCALE_API_KEY is required for minting device auth keys")
-	}
-	payload := map[string]any{
-		"capabilities": map[string]any{
-			"devices": map[string]any{
-				"create": map[string]any{
-					"reusable":      false,
-					"ephemeral":     true,
-					"preauthorized": true,
-					"tags":          []string{tag},
-				},
-			},
-		},
-		"expirySeconds": 3600,
-	}
-	body, _ := json.Marshal(payload)
-	apiURL := fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/keys", tailnet)
-	req, _ := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(tsAPIKey, "")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", sdk.Errf(sdk.CatProviderUnavailable, "proxmox.tailscale.api_error", "%v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", sdk.Errf(sdk.CatAuth, "proxmox.tailscale.api_status",
-			"tailscale API %d: %s", resp.StatusCode, string(raw))
-	}
-	var out struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", err
-	}
-	if out.Key == "" {
-		return "", sdk.Errf(sdk.CatInternal, "proxmox.tailscale.key_missing",
-			"no key in tailscale response: %s", string(raw))
-	}
-	return out.Key, nil
-}
-
-// tailscaleTagForSpec derives the advertised tag from the VM role/slug so the
-// tailnet ACL can group MSSP and tenant devices. Matches the qemu/vmware plugins.
-func tailscaleTagForSpec(spec sdk.VMSpec) string {
-	var prefix string
-	if pveClient != nil {
-		prefix = pveClient.cfg.TagPrefix
-	}
-	role := spec.Tags["role"]
-	slug := spec.Tags["tenant_slug"]
-	if role == "mssp" {
-		return "tag:" + prefix + "mssp"
-	}
-	if role == "tenant" && slug != "" {
-		return "tag:" + prefix + "tenant-" + slug
-	}
-	return "tag:" + prefix + "lp-" + spec.VMKey
-}
-
-func hostnameFor(vmKey string) string {
-	return "lp-" + sanitizeHostname(vmKey)
-}
-
-func sanitizeHostname(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 40 {
-		out = out[:40]
-	}
-	if out == "" {
-		buf := make([]byte, 4)
-		_, _ = rand.Read(buf)
-		out = "lp-" + hex.EncodeToString(buf)
-	}
-	return out
-}
-
-func mergeSSHKeys(a, b []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(a)+len(b))
-	for _, k := range append(append([]string{}, a...), b...) {
-		if k = strings.TrimSpace(k); k != "" && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	return out
 }
 
 func sanitizeName(name, fallback string) string {

@@ -9,30 +9,26 @@
 // reports the instance's public/private addresses.
 //
 // Config (from launchpad, via plugin.initialize params.config):
-//   region:            fallback for VMSpec.Region (default: $AWS_REGION)
-//   instance_type:     fallback for VMSpec.SizeHint (default: "t3.large")
-//   ami:               fallback for VMSpec.Image (default: latest Ubuntu 24.04 LTS amd64)
-//   subnet_id:         optional VPC subnet to launch into
-//   security_group_id: optional security group to attach
-//   tailnet:           tailnet name (used by the orchestrator/user-data)
-//   ssh_keys:          fallback authorized public keys
+//
+//	region:            fallback for VMSpec.Region (default: $AWS_REGION)
+//	instance_type:     fallback for VMSpec.SizeHint (default: "t3.large")
+//	ami:               fallback for VMSpec.Image (default: latest Ubuntu 24.04 LTS amd64)
+//	subnet_id:         optional VPC subnet to launch into
+//	security_group_id: optional security group to attach
+//	tailnet:           tailnet name (used by the orchestrator/user-data)
+//	ssh_keys:          fallback authorized public keys
 //
 // Env:
-//   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_PROFILE
-//   AWS_REGION (default cred chain + region resolution)
-//   TAILSCALE_API_KEY
+//
+//	AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_PROFILE
+//	AWS_REGION (default cred chain + region resolution)
+//	TAILSCALE_API_KEY
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -44,6 +40,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	sdk "github.com/soctalk/launchpad-sdk-go"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/cloudinit"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/tailscale"
 )
 
 const (
@@ -59,7 +57,7 @@ const (
 	ubuntuOwner     = "099720109477"
 	ubuntuNameGlob  = "ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*"
 	defaultType     = "t3.large"
-	defaultDiskGB   = 50 // root volume; the SOC tenant (k3s + Wazuh) needs headroom
+	defaultDiskGB   = 50          // root volume; the SOC tenant (k3s + Wazuh) needs headroom
 	defaultProbeReg = "us-east-1" // only used to reach AWS for the auth probe
 	loginUser       = "ops"       // provisioned by cloud-init (composeUserData)
 )
@@ -67,6 +65,11 @@ const (
 type plugin struct {
 	client *ec2.Client
 	cfg    config
+
+	// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
+	// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
+	// the Network resource).
+	tsAPIKey string
 }
 
 type config struct {
@@ -81,14 +84,8 @@ type config struct {
 	SSHKeys         []string `json:"ssh_keys,omitempty"`
 }
 
-var p plugin
-
-// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
-// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
-// the Network resource).
-var tsAPIKey string
-
 func main() {
+	p := &plugin{}
 	err := sdk.Serve(sdk.Plugin{
 		Name:    name,
 		Version: version,
@@ -122,12 +119,12 @@ func main() {
 			"additionalProperties": false,
 		},
 
-		Initialize: initialize,
-		Plan:       plan,
-		Create:     create,
-		WaitReady:  waitReady,
-		Destroy:    destroy,
-		Inspect:    inspect,
+		Initialize: p.initialize,
+		Plan:       p.plan,
+		Create:     p.create,
+		WaitReady:  p.waitReady,
+		Destroy:    p.destroy,
+		Inspect:    p.inspect,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "aws plugin:", err)
@@ -135,7 +132,7 @@ func main() {
 	}
 }
 
-func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
+func (p *plugin) initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
 	cfg := config{
 		Region:       os.Getenv("AWS_REGION"),
 		InstanceType: defaultType,
@@ -172,7 +169,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 
 	// Tailscale API key: injected per-run from the Network resource. Required to
 	// mint the ephemeral device auth key baked into the instance's cloud-init.
-	tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
+	p.tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
 
 	// Region for the AWS SDK: config value, else AWS_REGION (already folded in),
 	// else a safe fallback so the auth probe still reaches AWS.
@@ -201,7 +198,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 }
 
 // resolveSpec merges spec defaults with plugin config fallbacks.
-func resolveSpec(spec *sdk.VMSpec) {
+func (p *plugin) resolveSpec(spec *sdk.VMSpec) {
 	if spec.Region == "" {
 		spec.Region = p.cfg.Region
 	}
@@ -219,9 +216,9 @@ func resolveSpec(spec *sdk.VMSpec) {
 	}
 }
 
-func plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
+func (p *plugin) plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
 	spec := params.Spec
-	resolveSpec(&spec)
+	p.resolveSpec(&spec)
 	if err := validateSpec(spec); err != nil {
 		return sdk.VMPlanResult{}, err
 	}
@@ -251,7 +248,7 @@ func validateSpec(spec sdk.VMSpec) error {
 	return nil
 }
 
-func requireClient() error {
+func (p *plugin) requireClient() error {
 	if p.client == nil {
 		return sdk.Errf(sdk.CatAuth, "aws.not_initialized",
 			"plugin.initialize has not been called successfully (check AWS credentials)")
@@ -259,29 +256,29 @@ func requireClient() error {
 	return nil
 }
 
-func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 	spec := params.Spec
-	resolveSpec(&spec)
+	p.resolveSpec(&spec)
 	if err := validateSpec(spec); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 
 	emit.Progress("lookup", 5, "checking for existing instance")
-	if existing, err := findByTags(ctx, spec.RunID, spec.VMKey); err != nil {
+	if existing, err := p.findByTags(ctx, spec.RunID, spec.VMKey); err != nil {
 		return sdk.VMCreateResult{}, sdk.Errf(sdk.CatInternal,
 			"aws.describe_failed", "listing existing instances: %v", err)
 	} else if existing != nil {
 		emit.Log("info", "reusing existing instance", map[string]any{"instance_id": aws.ToString(existing.InstanceId)})
-		return instanceToCreateResult(existing), nil
+		return p.instanceToCreateResult(existing), nil
 	}
 
 	ami := spec.Image
 	if ami == "" {
 		emit.Progress("resolve_ami", 15, "resolving latest Ubuntu 24.04 AMI")
-		resolved, err := resolveUbuntuAMI(ctx)
+		resolved, err := p.resolveUbuntuAMI(ctx)
 		if err != nil {
 			return sdk.VMCreateResult{}, err
 		}
@@ -292,14 +289,14 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// Tailscale and joins the tailnet on first boot. The orchestrator then
 	// resolves this instance by its tailnet hostname (lp-<vmKey>).
 	emit.Progress("tailscale", 25, "minting device auth key")
-	tag := tailscaleTagForSpec(spec)
-	tskey, err := mintTailscaleKey(ctx, p.cfg.Tailnet, tag)
+	tag := tailscale.TagForSpec(spec, p.cfg.TagPrefix)
+	tskey, err := tailscale.MintKey(ctx, p.cfg.Tailnet, tag)
 	if err != nil {
 		return sdk.VMCreateResult{}, err
 	}
-	userData := base64.StdEncoding.EncodeToString([]byte(composeUserData(cloudInitInputs{
-		Hostname:      hostnameFor(spec.VMKey),
-		SSHKeys:       mergeSSHKeys(p.cfg.SSHKeys, spec.SSHKeys),
+	userData := base64.StdEncoding.EncodeToString([]byte(cloudinit.Compose(cloudinit.Inputs{
+		Hostname:      tailscale.Hostname(spec.VMKey),
+		SSHKeys:       cloudinit.MergeSSHKeys(p.cfg.SSHKeys, spec.SSHKeys),
 		TailscaleKey:  tskey,
 		TailscaleTag:  tag,
 		ExtraUserData: spec.UserData,
@@ -334,7 +331,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// Size the root volume: the default Ubuntu AMI volume (~8GB) is too small
 	// for the SOC tenant (k3s + Wazuh), which hits DiskPressure and evicts pods.
 	if p.cfg.DiskGB > 0 {
-		root := rootDeviceName(ctx, ami)
+		root := p.rootDeviceName(ctx, ami)
 		input.BlockDeviceMappings = []ec2types.BlockDeviceMapping{{
 			DeviceName: aws.String(root),
 			Ebs: &ec2types.EbsBlockDevice{
@@ -357,16 +354,16 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	}
 	inst := out.Instances[0]
 	emit.Progress("create", 100, "instance launched")
-	return instanceToCreateResult(&inst), nil
+	return p.instanceToCreateResult(&inst), nil
 }
 
-func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMWaitReadyResult{}, err
 	}
 	deadline := time.Now().Add(20 * time.Minute)
 	for time.Now().Before(deadline) {
-		inst, err := lookupInstance(ctx, params.VMID, params.RunID, params.VMKey)
+		inst, err := p.lookupInstance(ctx, params.VMID, params.RunID, params.VMKey)
 		if err != nil {
 			// AWS is eventually consistent: for a few seconds after RunInstances a
 			// DescribeInstances by that ID can transiently return
@@ -425,15 +422,15 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMDestroyResult{}, err
 	}
 	var ids []string
 	if params.VMID != "" {
 		ids = []string{params.VMID}
 	} else {
-		found, err := findInstanceIDsByTags(ctx, params.RunID, params.VMKey)
+		found, err := p.findInstanceIDsByTags(ctx, params.RunID, params.VMKey)
 		if err != nil {
 			return sdk.VMDestroyResult{}, sdk.Errf(sdk.CatInternal,
 				"aws.describe_failed", "%v", err)
@@ -452,11 +449,11 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	return sdk.VMDestroyResult{Destroyed: true}, nil
 }
 
-func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
-	if err := requireClient(); err != nil {
+func (p *plugin) inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
+	if err := p.requireClient(); err != nil {
 		return sdk.VMInspectResult{}, err
 	}
-	inst, err := lookupInstance(ctx, params.VMID, params.RunID, params.VMKey)
+	inst, err := p.lookupInstance(ctx, params.VMID, params.RunID, params.VMKey)
 	if err != nil {
 		return sdk.VMInspectResult{}, err
 	}
@@ -487,14 +484,14 @@ func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) 
 // lookupInstance resolves an instance by VMID if given, else by tags. When
 // looked up by VMID it returns the instance even if terminated (so inspect
 // can report state); tag lookups only return non-terminated instances.
-func lookupInstance(ctx context.Context, vmID, runID, vmKey string) (*ec2types.Instance, error) {
+func (p *plugin) lookupInstance(ctx context.Context, vmID, runID, vmKey string) (*ec2types.Instance, error) {
 	if vmID != "" {
-		return getInstanceByID(ctx, vmID)
+		return p.getInstanceByID(ctx, vmID)
 	}
-	return findByTags(ctx, runID, vmKey)
+	return p.findByTags(ctx, runID, vmKey)
 }
 
-func getInstanceByID(ctx context.Context, id string) (*ec2types.Instance, error) {
+func (p *plugin) getInstanceByID(ctx context.Context, id string) (*ec2types.Instance, error) {
 	out, err := p.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{id},
 	})
@@ -513,7 +510,7 @@ func tagFilters(runID, vmKey string) []ec2types.Filter {
 	}
 }
 
-func findByTags(ctx context.Context, runID, vmKey string) (*ec2types.Instance, error) {
+func (p *plugin) findByTags(ctx context.Context, runID, vmKey string) (*ec2types.Instance, error) {
 	out, err := p.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: tagFilters(runID, vmKey),
 	})
@@ -523,7 +520,7 @@ func findByTags(ctx context.Context, runID, vmKey string) (*ec2types.Instance, e
 	return firstInstance(out), nil
 }
 
-func findInstanceIDsByTags(ctx context.Context, runID, vmKey string) ([]string, error) {
+func (p *plugin) findInstanceIDsByTags(ctx context.Context, runID, vmKey string) ([]string, error) {
 	out, err := p.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: tagFilters(runID, vmKey),
 	})
@@ -552,7 +549,7 @@ func firstInstance(out *ec2.DescribeInstancesOutput) *ec2types.Instance {
 	return nil
 }
 
-func resolveUbuntuAMI(ctx context.Context) (string, error) {
+func (p *plugin) resolveUbuntuAMI(ctx context.Context) (string, error) {
 	out, err := p.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
 		Owners: []string{ubuntuOwner},
 		Filters: []ec2types.Filter{
@@ -578,171 +575,14 @@ func resolveUbuntuAMI(ctx context.Context) (string, error) {
 	return aws.ToString(out.Images[0].ImageId), nil
 }
 
-// --- Tailscale join + cloud-init composition -------------------------------
-// Ported from the qemu-family plugins: cloud VMs join the tailnet on first boot
-// via a plugin-minted ephemeral auth key baked into cloud-init. The orchestrator
-// discovers each VM by its tailnet hostname (lp-<vmKey>) rather than a public IP.
-
-type cloudInitInputs struct {
-	Hostname      string
-	SSHKeys       []string
-	TailscaleKey  string
-	TailscaleTag  string
-	ExtraUserData string
-}
-
-// composeUserData builds a #cloud-config that provisions the ops user, installs
-// Tailscale, and joins the tailnet with the minted auth key.
-func composeUserData(in cloudInitInputs) string {
-	var b bytes.Buffer
-	b.WriteString("#cloud-config\n")
-	fmt.Fprintf(&b, "hostname: %s\n", in.Hostname)
-	b.WriteString("manage_etc_hosts: true\n")
-	b.WriteString("users:\n")
-	b.WriteString("  - default\n")
-	b.WriteString("  - name: ops\n")
-	b.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
-	b.WriteString("    shell: /bin/bash\n")
-	if len(in.SSHKeys) > 0 {
-		b.WriteString("    ssh_authorized_keys:\n")
-		for _, k := range in.SSHKeys {
-			fmt.Fprintf(&b, "      - %s\n", k)
-		}
-	}
-	b.WriteString("package_update: true\n")
-	b.WriteString("packages: [curl, ca-certificates, jq]\n")
-	b.WriteString("runcmd:\n")
-	b.WriteString("  - curl -fsSL https://tailscale.com/install.sh | sh\n")
-	fmt.Fprintf(&b,
-		"  - tailscale up --auth-key=%q --advertise-tags=%s --hostname=%s\n",
-		in.TailscaleKey, in.TailscaleTag, in.Hostname)
-	if in.ExtraUserData != "" {
-		for _, line := range strings.Split(strings.TrimSpace(in.ExtraUserData), "\n") {
-			fmt.Fprintf(&b, "  - %s\n", line)
-		}
-	}
-	return b.String()
-}
-
-// mintTailscaleKey creates a single-use, ephemeral, pre-authorized device auth
-// key tagged for this VM. Requires TAILSCALE_API_KEY (tsAPIKey).
-func mintTailscaleKey(ctx context.Context, tailnet, tag string) (string, error) {
-	if tailnet == "" {
-		return "", sdk.Errf(sdk.CatValidation, "aws.tailscale.no_tailnet", "tailnet is empty")
-	}
-	if tsAPIKey == "" {
-		return "", sdk.Errf(sdk.CatAuth, "aws.tailscale.no_api_key",
-			"TAILSCALE_API_KEY is required for minting device auth keys")
-	}
-	payload := map[string]any{
-		"capabilities": map[string]any{
-			"devices": map[string]any{
-				"create": map[string]any{
-					"reusable":      false,
-					"ephemeral":     true,
-					"preauthorized": true,
-					"tags":          []string{tag},
-				},
-			},
-		},
-		"expirySeconds": 3600,
-	}
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/keys", tailnet)
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(tsAPIKey, "")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", sdk.Errf(sdk.CatProviderUnavailable, "aws.tailscale.api_error", "%v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", sdk.Errf(sdk.CatAuth, "aws.tailscale.api_status",
-			"tailscale API %d: %s", resp.StatusCode, string(raw))
-	}
-	var out struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", err
-	}
-	if out.Key == "" {
-		return "", sdk.Errf(sdk.CatInternal, "aws.tailscale.key_missing",
-			"no key in tailscale response: %s", string(raw))
-	}
-	return out.Key, nil
-}
-
-// tailscaleTagForSpec derives the advertised tag from the VM role/slug so the
-// tailnet ACL can group MSSP and tenant devices. Matches the qemu/vmware plugins.
-func tailscaleTagForSpec(spec sdk.VMSpec) string {
-	prefix := p.cfg.TagPrefix
-	role := spec.Tags["role"]
-	slug := spec.Tags["tenant_slug"]
-	if role == "mssp" {
-		return "tag:" + prefix + "mssp"
-	}
-	if role == "tenant" && slug != "" {
-		return "tag:" + prefix + "tenant-" + slug
-	}
-	return "tag:" + prefix + "lp-" + spec.VMKey
-}
-
-func hostnameFor(vmKey string) string {
-	return "lp-" + sanitizeHostname(vmKey)
-}
-
-func sanitizeHostname(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 40 {
-		out = out[:40]
-	}
-	if out == "" {
-		buf := make([]byte, 4)
-		_, _ = rand.Read(buf)
-		out = "lp-" + hex.EncodeToString(buf)
-	}
-	return out
-}
-
-func mergeSSHKeys(a, b []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(a)+len(b))
-	for _, k := range append(append([]string{}, a...), b...) {
-		if k = strings.TrimSpace(k); k != "" && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	return out
-}
-
-func instanceToCreateResult(inst *ec2types.Instance) sdk.VMCreateResult {
+func (p *plugin) instanceToCreateResult(inst *ec2types.Instance) sdk.VMCreateResult {
 	id := aws.ToString(inst.InstanceId)
 	return sdk.VMCreateResult{
-		VMID:        id,
-		IPv4:        aws.ToString(inst.PublicIpAddress),
-		IPv6:        ipv6Of(inst),
-		SSHUser:     loginUser,
-		SSHPort:     22,
-		ProviderURL: fmt.Sprintf("https://console.aws.amazon.com/ec2/home?region=%s#InstanceDetails:instanceId=%s", p.cfg.Region, id),
-		Metadata: map[string]string{
-			"provider":          "aws",
-			"region":            p.cfg.Region,
-			"availability_zone": azOf(inst),
-			"instance_type":     string(inst.InstanceType),
-			"private_ip":        aws.ToString(inst.PrivateIpAddress),
-		},
+		VMID:    id,
+		IPv4:    aws.ToString(inst.PublicIpAddress),
+		IPv6:    ipv6Of(inst),
+		SSHUser: loginUser,
+		SSHPort: 22,
 	}
 }
 
@@ -794,7 +634,7 @@ func azOf(inst *ec2types.Instance) string {
 // rootDeviceName returns the AMI's root block-device name (e.g. /dev/sda1) so
 // the resized root volume overrides the right device. Falls back to /dev/sda1
 // (the Ubuntu HVM default) if the image can't be described.
-func rootDeviceName(ctx context.Context, ami string) string {
+func (p *plugin) rootDeviceName(ctx context.Context, ami string) string {
 	out, err := p.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
 		ImageIds: []string{ami},
 	})

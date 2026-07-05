@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +61,11 @@ type StartConfig struct {
 	// HelloTimeout caps the wait for the plugin's initial hello frame.
 	// Default 15s.
 	HelloTimeout time.Duration
+
+	// AllowUnverified permits spawning when no SpawnVerifier is configured.
+	// Required to make the unverified path explicit: production sets a
+	// SpawnVerifier via main, so only tests/library callers opt in here.
+	AllowUnverified bool
 }
 
 // SpawnVerifier, if set, is called with a manifest immediately before its
@@ -78,21 +84,42 @@ func Start(ctx context.Context, m *Manifest, cfg StartConfig) (*Client, error) {
 		cfg.HelloTimeout = 15 * time.Second
 	}
 
+	// Fail closed: refuse to spawn unverified unless a verifier is wired or the
+	// caller explicitly opts out. A nil verifier used to silently skip all trust.
 	if SpawnVerifier != nil {
 		if err := SpawnVerifier(m); err != nil {
 			return nil, fmt.Errorf("refusing to spawn plugin %q: %w", m.Name, err)
 		}
+	} else if !cfg.AllowUnverified {
+		return nil, fmt.Errorf("refusing to spawn plugin %q: no spawn verifier configured", m.Name)
 	}
 
 	// Build a clean environment for the child. Do not use os.Setenv (parent
 	// scope). Do not inherit anything from the parent env unless allow-listed.
+	// Operator-injected ExtraEnv must stay within the plugin's declared (and,
+	// for managed plugins, signature-verified) env allow-list, so a host/network
+	// config cannot smuggle arbitrary env keys past the signed policy.
+	allowed := make(map[string]bool, len(cfg.EnvAllowlist))
 	env := make([]string, 0, len(cfg.EnvAllowlist)+len(cfg.ExtraEnv)+1)
 	for _, key := range cfg.EnvAllowlist {
+		allowed[key] = true
 		if v, ok := os.LookupEnv(key); ok {
 			env = append(env, key+"="+v)
 		}
 	}
-	env = append(env, cfg.ExtraEnv...)
+	for _, kv := range cfg.ExtraEnv {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		// Enforce the allow-list: an injected key the plugin didn't declare is
+		// dropped, not forwarded, so a host/network config can't smuggle
+		// arbitrary env past the (signed, for managed plugins) policy.
+		if !allowed[key] {
+			continue
+		}
+		env = append(env, kv)
+	}
 	// Provide a minimal PATH; some providers shell out to helpers.
 	env = append(env, "PATH=/usr/local/bin:/usr/bin:/bin")
 
@@ -161,16 +188,24 @@ func Start(ctx context.Context, m *Manifest, cfg StartConfig) (*Client, error) {
 }
 
 // recvLoop dispatches frames: responses → pending map, notifications →
-// notifications channel or dropped.
+// notifications channel or dropped. When the reader exits — clean EOF or a
+// transport/parse error — every in-flight Call is failed immediately rather
+// than left to hit its context deadline, and a plugin that errored mid-stream
+// is killed so it can't linger half-broken.
 func (c *Client) recvLoop() {
+	err := c.recvFrames()
+	c.failPending(err)
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(os.Stderr, "launchpad: plugin %q recv error: %v\n", c.Manifest.Name, err)
+		c.hardKill()
+	}
+}
+
+func (c *Client) recvFrames() error {
 	for {
 		env, err := c.transport.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return
-			}
-			fmt.Fprintf(os.Stderr, "launchpad: plugin %q recv error: %v\n", c.Manifest.Name, err)
-			return
+			return err
 		}
 		if env.ID != nil && env.Method == "" {
 			// Response frame.
@@ -192,6 +227,24 @@ func (c *Client) recvLoop() {
 		}
 		// Any other shape is a protocol violation; ignore silently.
 	}
+}
+
+// failPending unblocks every in-flight Call with a synthetic error response so
+// none hangs waiting for a reply that will never arrive.
+func (c *Client) failPending(cause error) {
+	if cause == nil {
+		cause = io.EOF
+	}
+	c.pending.Range(func(key, val any) bool {
+		c.pending.Delete(key)
+		select {
+		case val.(chan *sdk.Envelope) <- &sdk.Envelope{
+			Error: &sdk.ProtocolError{Code: -32000, Message: fmt.Sprintf("plugin stream closed: %v", cause)},
+		}:
+		default:
+		}
+		return true
+	})
 }
 
 // Call sends a request, waits for the response, and unmarshals result into dst.
@@ -267,12 +320,6 @@ func (c *Client) hardKill() {
 	if c.cmd != nil && c.cmd.Process != nil {
 		_ = c.cmd.Process.Kill()
 	}
-}
-
-// Wait blocks until the plugin exits.
-func (c *Client) Wait() error {
-	<-c.done
-	return c.exitErr
 }
 
 // RPCError is what Call returns when the plugin replies with an error frame.

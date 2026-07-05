@@ -43,6 +43,8 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 
 	sdk "github.com/soctalk/launchpad-sdk-go"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/cloudinit"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/tailscale"
 )
 
 func byteReader(data []byte) io.Reader { return bytes.NewReader(data) }
@@ -69,7 +71,7 @@ type config struct {
 	BaseVMOverride string `json:"base_vm,omitempty"` // if set, use this VM as clone source
 }
 
-var (
+type provider struct {
 	cfg       config
 	vc        *vim25.Client
 	finder    *find.Finder
@@ -77,9 +79,10 @@ var (
 	tsAPIKey  string
 	baseVMMu  sync.Mutex
 	baseVMRef *object.VirtualMachine
-)
+}
 
 func main() {
+	p := &provider{}
 	err := sdk.Serve(sdk.Plugin{
 		Name:    name,
 		Version: version,
@@ -101,13 +104,13 @@ func main() {
 			},
 			"required": []string{"esxi_url", "datastore", "network", "tailnet"},
 		},
-		Initialize: initialize,
-		Plan:       plan,
-		Create:     create,
-		WaitReady:  waitReady,
-		Destroy:    destroy,
-		Inspect:    inspect,
-		Shutdown:   shutdown,
+		Initialize: p.initialize,
+		Plan:       p.plan,
+		Create:     p.create,
+		WaitReady:  p.waitReady,
+		Destroy:    p.destroy,
+		Inspect:    p.inspect,
+		Shutdown:   p.shutdown,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vmware plugin:", err)
@@ -115,26 +118,26 @@ func main() {
 	}
 }
 
-func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
+func (p *provider) initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
 	if raw, err := json.Marshal(params.Config); err == nil {
-		_ = json.Unmarshal(raw, &cfg)
+		_ = json.Unmarshal(raw, &p.cfg)
 	}
-	if cfg.ESXiURL == "" || cfg.Datastore == "" || cfg.Network == "" || cfg.Tailnet == "" {
+	if p.cfg.ESXiURL == "" || p.cfg.Datastore == "" || p.cfg.Network == "" || p.cfg.Tailnet == "" {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatValidation,
 			"vmware.config.incomplete",
 			"esxi_url, datastore, network, tailnet are all required")
 	}
-	if cfg.CPU == 0 {
-		cfg.CPU = 4
+	if p.cfg.CPU == 0 {
+		p.cfg.CPU = 4
 	}
-	if cfg.MemoryMB == 0 {
-		cfg.MemoryMB = 8192
+	if p.cfg.MemoryMB == 0 {
+		p.cfg.MemoryMB = 8192
 	}
-	if cfg.DiskGB == 0 {
-		cfg.DiskGB = 60
+	if p.cfg.DiskGB == 0 {
+		p.cfg.DiskGB = 60
 	}
-	if cfg.OVAURL == "" {
-		cfg.OVAURL = defaultOVAURL
+	if p.cfg.OVAURL == "" {
+		p.cfg.OVAURL = defaultOVAURL
 	}
 
 	user := os.Getenv("ESXI_USERNAME")
@@ -144,14 +147,14 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 			"vmware.auth.missing_creds",
 			"ESXI_USERNAME and ESXI_PASSWORD environment variables are required")
 	}
-	tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
-	if tsAPIKey == "" {
+	p.tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
+	if p.tsAPIKey == "" {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatAuth,
 			"vmware.tailscale.missing_api_key",
 			"TAILSCALE_API_KEY is required for minting device auth keys")
 	}
 
-	u, err := soap.ParseURL(cfg.ESXiURL)
+	u, err := soap.ParseURL(p.cfg.ESXiURL)
 	if err != nil {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatValidation,
 			"vmware.esxi_url.invalid", "cannot parse esxi_url: %v", err)
@@ -163,48 +166,48 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 	c, err := govmomi.NewClient(ctx, u, true)
 	if err != nil {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatProviderUnavailable,
-			"vmware.esxi.unreachable", "cannot log in to %s: %v", cfg.ESXiURL, err)
+			"vmware.esxi.unreachable", "cannot log in to %s: %v", p.cfg.ESXiURL, err)
 	}
-	vc = c.Client
+	p.vc = c.Client
 
 	// Activate 60-day evaluation license. Standalone ESXi ships with the
 	// Free Hypervisor license which BLOCKS VM lifecycle operations via the
 	// API (ImportVApp, CloneVM). Eval mode unlocks the full API for 60 days.
 	// The null key is VMware's canonical eval trigger.
-	lm := license.NewManager(vc)
+	lm := license.NewManager(p.vc)
 	if _, err := lm.Update(ctx, "00000-00000-00000-00000-00000", nil); err != nil {
 		// Non-fatal: some ESXi versions/vCenter don't allow API license changes.
 		// Real operation will fail with a clearer error if we're still on Free.
 	}
 
-	finder = find.NewFinder(vc, true)
-	dcs, err := finder.DatacenterList(ctx, "*")
+	p.finder = find.NewFinder(p.vc, true)
+	dcs, err := p.finder.DatacenterList(ctx, "*")
 	if err != nil || len(dcs) == 0 {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatProviderUnavailable,
 			"vmware.esxi.no_datacenter", "no datacenter visible on ESXi: %v", err)
 	}
-	dc = dcs[0]
-	finder.SetDatacenter(dc)
+	p.dc = dcs[0]
+	p.finder.SetDatacenter(p.dc)
 
 	// Verify datastore + network exist.
-	if _, err := finder.Datastore(ctx, cfg.Datastore); err != nil {
+	if _, err := p.finder.Datastore(ctx, p.cfg.Datastore); err != nil {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatValidation,
-			"vmware.datastore.not_found", "datastore %q not found: %v", cfg.Datastore, err)
+			"vmware.datastore.not_found", "datastore %q not found: %v", p.cfg.Datastore, err)
 	}
-	if _, err := finder.Network(ctx, cfg.Network); err != nil {
+	if _, err := p.finder.Network(ctx, p.cfg.Network); err != nil {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatValidation,
-			"vmware.network.not_found", "network %q not found: %v", cfg.Network, err)
+			"vmware.network.not_found", "network %q not found: %v", p.cfg.Network, err)
 	}
 
 	return sdk.InitializeResult{Ready: true}, nil
 }
 
-func shutdown(ctx context.Context) error { return nil }
+func (p *provider) shutdown(ctx context.Context) error { return nil }
 
-func plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
+func (p *provider) plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
 	return sdk.VMPlanResult{
 		Summary: fmt.Sprintf("vmware: %s on %s (%dvCPU/%dMB, tailscale hostname lp-%s)",
-			params.Spec.Name, cfg.ESXiURL, cfg.CPU, cfg.MemoryMB, params.Spec.VMKey),
+			params.Spec.Name, p.cfg.ESXiURL, p.cfg.CPU, p.cfg.MemoryMB, params.Spec.VMKey),
 		EstimatedDurationSec: 300,
 	}, nil
 }
@@ -221,8 +224,8 @@ type vmSize struct {
 // the spec's SizeHint — a comma-separated k=v list, e.g.
 // "mem=8192,res=4096,cpu=4,disk=40". Unknown keys are ignored so the hint
 // stays forward-compatible across plugins.
-func sizeFor(spec sdk.VMSpec) vmSize {
-	s := vmSize{cpu: cfg.CPU, memMB: cfg.MemoryMB, diskGB: cfg.DiskGB}
+func (p *provider) sizeFor(spec sdk.VMSpec) vmSize {
+	s := vmSize{cpu: p.cfg.CPU, memMB: p.cfg.MemoryMB, diskGB: p.cfg.DiskGB}
 	for _, kv := range strings.Split(spec.SizeHint, ",") {
 		k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
 		if !ok {
@@ -246,60 +249,29 @@ func sizeFor(spec sdk.VMSpec) vmSize {
 	return s
 }
 
-func hostnameFor(vmKey string) string { return "lp-" + sanitizeHostname(vmKey) }
-
-// mergeSSHKeys returns the de-duplicated union of provider-config and
-// spec-level SSH keys (config keys first), so a run that sets ssh_keys only
-// at the launchpad level still authorizes the operator's key.
-func mergeSSHKeys(a, b []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(a)+len(b))
-	for _, k := range append(append([]string{}, a...), b...) {
-		if k = strings.TrimSpace(k); k != "" && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	return out
-}
-
 func vmNameFor(runID, vmKey string) string { return "lp-" + runID + "-" + vmKey }
 
-// tailscaleTagForSpec mirrors the qemu plugin.
-func tailscaleTagForSpec(spec sdk.VMSpec) string {
-	role := spec.Tags["role"]
-	slug := spec.Tags["tenant_slug"]
-	prefix := cfg.TagPrefix
-	if role == "mssp" {
-		return "tag:" + prefix + "mssp"
-	}
-	if role == "tenant" && slug != "" {
-		return "tag:" + prefix + "tenant-" + slug
-	}
-	return "tag:" + prefix + "lp-" + spec.VMKey
-}
-
-func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
-	if vc == nil {
+func (p *provider) create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
+	if p.vc == nil {
 		return sdk.VMCreateResult{}, sdk.Errf(sdk.CatAuth,
 			"vmware.not_initialized",
 			"plugin.initialize has not been called successfully")
 	}
 	spec := params.Spec
 	name := vmNameFor(spec.RunID, spec.VMKey)
-	size := sizeFor(spec)
+	size := p.sizeFor(spec)
 
 	// Idempotency: if a VM with this name already exists, return its info.
 	emit.Progress("lookup", 3, "checking for existing VM")
-	if existing, _ := finder.VirtualMachine(ctx, name); existing != nil {
-		return currentResult(ctx, spec, existing, emit)
+	if existing, _ := p.finder.VirtualMachine(ctx, name); existing != nil {
+		return p.currentResult(ctx, spec, existing, emit)
 	}
 
 	// Mint Tailscale auth key.
 	emit.Progress("tailscale", 25, "minting device auth key")
-	tag := tailscaleTagForSpec(spec)
-	hostname := hostnameFor(spec.VMKey)
-	tskey, err := mintTailscaleKey(ctx, cfg.Tailnet, tag)
+	tag := tailscale.TagForSpec(spec, p.cfg.TagPrefix)
+	hostname := tailscale.Hostname(spec.VMKey)
+	tskey, err := tailscale.MintKey(ctx, p.cfg.Tailnet, tag)
 	if err != nil {
 		return sdk.VMCreateResult{}, err
 	}
@@ -309,7 +281,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// cache-and-clone approach and import fresh per VM. Slower on subsequent
 	// VMs but works against a bare ESXi host.
 	emit.Progress("clone", 40, "importing OVA as new VM")
-	imported, err := importOVA(ctx, name, emit)
+	imported, err := p.importOVA(ctx, name, emit)
 	if err != nil {
 		return sdk.VMCreateResult{}, err
 	}
@@ -321,8 +293,8 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// cloud-init's growpart / cc_growpart runs on boot and expands the
 	// partition + filesystem into whatever new capacity we set here.
 	emit.Progress("cloud_init", 70, "configuring CPU/RAM/disk + guestinfo cloud-init")
-	userData := composeUserData(cloudInitInputs{
-		Hostname: hostname, SSHKeys: mergeSSHKeys(cfg.SSHKeys, spec.SSHKeys),
+	userData := cloudinit.Compose(cloudinit.Inputs{
+		Hostname: hostname, SSHKeys: cloudinit.MergeSSHKeys(p.cfg.SSHKeys, spec.SSHKeys),
 		TailscaleKey: tskey, TailscaleTag: tag, ExtraUserData: spec.UserData,
 	})
 	metaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", spec.VMKey, hostname)
@@ -391,48 +363,35 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 		VMID:    cloned.Reference().Value,
 		SSHUser: "ops",
 		SSHPort: 22,
-		Metadata: map[string]string{
-			"provider":            "vmware",
-			"esxi":                cfg.ESXiURL,
-			"vm_name":             name,
-			"tailscale_hostname":  hostname,
-			"tailscale_tag":       tag,
-		},
 	}, nil
 }
 
-func currentResult(ctx context.Context, spec sdk.VMSpec, v *object.VirtualMachine, emit sdk.Emitter) (sdk.VMCreateResult, error) {
-	hostname := hostnameFor(spec.VMKey)
-	tag := tailscaleTagForSpec(spec)
+func (p *provider) currentResult(ctx context.Context, spec sdk.VMSpec, v *object.VirtualMachine, emit sdk.Emitter) (sdk.VMCreateResult, error) {
 	return sdk.VMCreateResult{
 		VMID: v.Reference().Value, SSHUser: "ops", SSHPort: 22,
-		Metadata: map[string]string{
-			"provider": "vmware", "esxi": cfg.ESXiURL, "vm_name": v.Name(),
-			"tailscale_hostname": hostname, "tailscale_tag": tag,
-		},
 	}, nil
 }
 
-func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
-	if tsAPIKey == "" {
+func (p *provider) waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
+	if p.tsAPIKey == "" {
 		return sdk.VMWaitReadyResult{}, sdk.Errf(sdk.CatAuth,
 			"vmware.not_initialized",
 			"plugin.initialize has not been called successfully")
 	}
-	hostname := hostnameFor(params.VMKey)
+	hostname := tailscale.Hostname(params.VMKey)
 	deadline := time.Now().Add(20 * time.Minute)
 	for time.Now().Before(deadline) {
-		device, err := findTailscaleDevice(ctx, cfg.Tailnet, hostname)
+		device, err := tailscale.FindDevice(ctx, p.cfg.Tailnet, hostname)
 		if err != nil {
 			emit.Log("debug", "tailscale API error", map[string]any{"err": err.Error()})
 		}
 		if device != nil {
 			online := "yes"
-			if !device.online() {
+			if !device.Online() {
 				online = "no"
 			}
 			emit.Progress("wait_ready", 60, fmt.Sprintf("tailscale device found; online=%s", online))
-			if device.online() {
+			if device.Online() {
 				v4, v6 := "", ""
 				for _, a := range device.Addresses {
 					if strings.Contains(a, ":") {
@@ -457,8 +416,8 @@ func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitt
 		"tailscale device %s did not come online within 20m", hostname)
 }
 
-func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
-	if vc == nil {
+func (p *provider) destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
+	if p.vc == nil {
 		return sdk.VMDestroyResult{}, sdk.Errf(sdk.CatAuth,
 			"vmware.not_initialized",
 			"plugin.initialize has not been called successfully")
@@ -467,7 +426,7 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	didWork := false
 
 	emit.Progress("destroy", 20, "looking up VM")
-	v, err := finder.VirtualMachine(ctx, name)
+	v, err := p.finder.VirtualMachine(ctx, name)
 	if err == nil && v != nil {
 		emit.Progress("destroy", 40, "powering off")
 		if state, _ := v.PowerState(ctx); state == types.VirtualMachinePowerStatePoweredOn {
@@ -485,21 +444,21 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	}
 
 	emit.Progress("destroy", 85, "revoking tailscale device")
-	hostname := hostnameFor(params.VMKey)
-	if device, _ := findTailscaleDevice(ctx, cfg.Tailnet, hostname); device != nil {
-		if err := deleteTailscaleDevice(ctx, device.ID); err == nil {
+	hostname := tailscale.Hostname(params.VMKey)
+	if device, _ := tailscale.FindDevice(ctx, p.cfg.Tailnet, hostname); device != nil {
+		if err := tailscale.DeleteDevice(ctx, device.ID); err == nil {
 			didWork = true
 		}
 	}
 	return sdk.VMDestroyResult{Destroyed: didWork}, nil
 }
 
-func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
-	if vc == nil {
+func (p *provider) inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
+	if p.vc == nil {
 		return sdk.VMInspectResult{Exists: false}, nil
 	}
 	name := vmNameFor(params.RunID, params.VMKey)
-	v, err := finder.VirtualMachine(ctx, name)
+	v, err := p.finder.VirtualMachine(ctx, name)
 	if err != nil || v == nil {
 		return sdk.VMInspectResult{Exists: false}, nil
 	}
@@ -517,8 +476,8 @@ func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) 
 		state = "suspended"
 	}
 	ipv4 := ""
-	if device, _ := findTailscaleDevice(ctx, cfg.Tailnet, hostnameFor(params.VMKey)); device != nil {
-		ipv4 = device.primaryIPv4()
+	if device, _ := tailscale.FindDevice(ctx, p.cfg.Tailnet, tailscale.Hostname(params.VMKey)); device != nil {
+		ipv4 = device.PrimaryIPv4()
 	}
 	return sdk.VMInspectResult{
 		Exists: true, VMID: v.Reference().Value, State: state,
@@ -527,8 +486,8 @@ func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) 
 }
 
 // findResourcePool returns the standalone ESXi host's default pool.
-func findResourcePool(ctx context.Context) (*object.ResourcePool, error) {
-	pools, err := finder.ResourcePoolList(ctx, "*")
+func (p *provider) findResourcePool(ctx context.Context) (*object.ResourcePool, error) {
+	pools, err := p.finder.ResourcePoolList(ctx, "*")
 	if err != nil || len(pools) == 0 {
 		return nil, sdk.Errf(sdk.CatProviderUnavailable,
 			"vmware.no_resource_pool", "no resource pool visible: %v", err)
@@ -538,35 +497,35 @@ func findResourcePool(ctx context.Context) (*object.ResourcePool, error) {
 
 // ensureBaseVM downloads the Ubuntu Noble OVA and imports it as a VM the
 // first time, then reuses it for subsequent creates in the same process.
-func ensureBaseVM(ctx context.Context, emit sdk.Emitter) (*object.VirtualMachine, error) {
-	baseVMMu.Lock()
-	defer baseVMMu.Unlock()
-	if baseVMRef != nil {
-		return baseVMRef, nil
+func (p *provider) ensureBaseVM(ctx context.Context, emit sdk.Emitter) (*object.VirtualMachine, error) {
+	p.baseVMMu.Lock()
+	defer p.baseVMMu.Unlock()
+	if p.baseVMRef != nil {
+		return p.baseVMRef, nil
 	}
-	if cfg.BaseVMOverride != "" {
-		v, err := finder.VirtualMachine(ctx, cfg.BaseVMOverride)
+	if p.cfg.BaseVMOverride != "" {
+		v, err := p.finder.VirtualMachine(ctx, p.cfg.BaseVMOverride)
 		if err != nil {
 			return nil, sdk.Errf(sdk.CatValidation,
-				"vmware.base_vm.not_found", "base_vm %q: %v", cfg.BaseVMOverride, err)
+				"vmware.base_vm.not_found", "base_vm %q: %v", p.cfg.BaseVMOverride, err)
 		}
-		baseVMRef = v
+		p.baseVMRef = v
 		return v, nil
 	}
 
-	baseName := baseVMName(cfg.OVAURL)
-	if v, err := finder.VirtualMachine(ctx, baseName); err == nil && v != nil {
-		baseVMRef = v
+	baseName := baseVMName(p.cfg.OVAURL)
+	if v, err := p.finder.VirtualMachine(ctx, baseName); err == nil && v != nil {
+		p.baseVMRef = v
 		return v, nil
 	}
 
 	// Fresh import.
 	emit.Progress("base_vm_import", 15, "downloading + importing OVA (~500 MB, ~1-2 min)")
-	imported, err := importOVA(ctx, baseName, emit)
+	imported, err := p.importOVA(ctx, baseName, emit)
 	if err != nil {
 		return nil, err
 	}
-	baseVMRef = imported
+	p.baseVMRef = imported
 	return imported, nil
 }
 
@@ -577,37 +536,37 @@ func baseVMName(ovaURL string) string {
 
 // importOVA downloads the OVA + uses ovf.Manager + nfc.Lease to import the
 // vmdks into the datastore, creating a new VM in the process.
-func importOVA(ctx context.Context, vmName string, emit sdk.Emitter) (*object.VirtualMachine, error) {
-	ovaBytes, err := downloadOVA(ctx, cfg.OVAURL)
+func (p *provider) importOVA(ctx context.Context, vmName string, emit sdk.Emitter) (*object.VirtualMachine, error) {
+	ovaBytes, err := downloadOVA(ctx, p.cfg.OVAURL)
 	if err != nil {
 		return nil, sdk.Errf(sdk.CatProviderUnavailable,
-			"vmware.ova.download_failed", "downloading %s: %v", cfg.OVAURL, err)
+			"vmware.ova.download_failed", "downloading %s: %v", p.cfg.OVAURL, err)
 	}
 	ovfXML, vmdkParts, err := extractOVA(ovaBytes)
 	if err != nil {
 		return nil, sdk.Errf(sdk.CatValidation,
 			"vmware.ova.parse_failed", "parse OVA: %v", err)
 	}
-	pool, err := findResourcePool(ctx)
+	pool, err := p.findResourcePool(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ds, err := finder.Datastore(ctx, cfg.Datastore)
+	ds, err := p.finder.Datastore(ctx, p.cfg.Datastore)
 	if err != nil {
 		return nil, err
 	}
-	net, err := finder.Network(ctx, cfg.Network)
+	net, err := p.finder.Network(ctx, p.cfg.Network)
 	if err != nil {
 		return nil, err
 	}
 
-	m := ovf.NewManager(vc)
+	m := ovf.NewManager(p.vc)
 	networkMap := []types.OvfNetworkMapping{{Name: "VM Network", Network: net.Reference()}}
 	importSpec, err := m.CreateImportSpec(ctx, ovfXML,
 		pool, ds,
 		&types.OvfCreateImportSpecParams{
-			EntityName: vmName,
-			NetworkMapping: networkMap,
+			EntityName:       vmName,
+			NetworkMapping:   networkMap,
 			DiskProvisioning: "thin",
 		})
 	if err != nil {
@@ -619,7 +578,7 @@ func importOVA(ctx context.Context, vmName string, emit sdk.Emitter) (*object.Vi
 			"vmware.ova.spec_error", "OVF spec: %+v", importSpec.Error)
 	}
 
-	folder, _ := dc.Folders(ctx)
+	folder, _ := p.dc.Folders(ctx)
 	// The vmdk upload streams hundreds of MB over the (possibly tunneled)
 	// connection to ESXi. Transient drops — broken pipe, EOF, connection
 	// reset, 503 — are common on constrained links, so retry the whole
@@ -666,7 +625,7 @@ func importOVA(ctx context.Context, vmName string, emit sdk.Emitter) (*object.Vi
 			map[string]any{"attempt": attempt, "of": maxImportAttempts, "err": uploadErr.Error()})
 		_ = lease.Abort(ctx, nil)
 		// Best-effort: remove any half-created VM so the re-import name is free.
-		if v, ferr := finder.VirtualMachine(ctx, vmName); ferr == nil && v != nil {
+		if v, ferr := p.finder.VirtualMachine(ctx, vmName); ferr == nil && v != nil {
 			if t, derr := v.Destroy(ctx); derr == nil {
 				_ = t.WaitEx(ctx)
 			}
@@ -678,11 +637,10 @@ func importOVA(ctx context.Context, vmName string, emit sdk.Emitter) (*object.Vi
 	}
 
 	// Look up the newly-imported VM.
-	v, err := finder.VirtualMachine(ctx, vmName)
+	v, err := p.finder.VirtualMachine(ctx, vmName)
 	if err != nil {
 		return nil, sdk.Errf(sdk.CatInternal,
 			"vmware.ova.lookup_failed", "imported VM not found: %v", err)
 	}
 	return v, nil
 }
-

@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	sdk "github.com/soctalk/launchpad-sdk-go"
@@ -20,6 +19,7 @@ import (
 	"github.com/soctalk/launchpad/internal/cli"
 	"github.com/soctalk/launchpad/internal/pluginhost"
 	"github.com/soctalk/launchpad/internal/pluginstore"
+	"github.com/soctalk/launchpad/internal/targetresolver"
 )
 
 // version is the launchpad release. Injected at build time via
@@ -249,24 +249,8 @@ func cmdPluginList() {
 	}
 }
 
-// resolveManifest accepts a name (looked up via discovery) or a directory
-// path (containing plugin.yaml).
-func resolveManifest(nameOrPath string) (*pluginhost.Manifest, error) {
-	if strings.ContainsRune(nameOrPath, '/') || strings.ContainsRune(nameOrPath, '.') {
-		// Path-ish.
-		return pluginhost.LoadManifest(nameOrPath)
-	}
-	manifests, _ := pluginhost.DiscoverPlugins()
-	for _, m := range manifests {
-		if m.Name == nameOrPath {
-			return m, nil
-		}
-	}
-	return nil, fmt.Errorf("plugin %q not found", nameOrPath)
-}
-
 func cmdPluginVerify(nameOrPath string) {
-	m, err := resolveManifest(nameOrPath)
+	m, err := targetresolver.Manifest(nameOrPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -285,7 +269,7 @@ func cmdPluginVerify(nameOrPath string) {
 }
 
 func cmdPluginRun(nameOrPath, method, paramsJSON string) {
-	m, err := resolveManifest(nameOrPath)
+	m, err := targetresolver.Manifest(nameOrPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

@@ -76,10 +76,6 @@ func main() {
 				IPv4:    deterministicIP(p.Spec.RunID, p.Spec.VMKey),
 				SSHUser: "ubuntu",
 				SSHPort: 22,
-				Metadata: map[string]string{
-					"provider": "mock",
-					"region":   p.Spec.Region,
-				},
 			}
 			registry[key] = res
 			emit.Progress("create", 100, "VM ready")
@@ -107,12 +103,11 @@ func main() {
 				return sdk.VMInspectResult{Exists: false}, nil
 			}
 			return sdk.VMInspectResult{
-				Exists:   true,
-				VMID:     existing.VMID,
-				State:    "running",
-				IPv4:     existing.IPv4,
-				SSHUser:  existing.SSHUser,
-				Metadata: existing.Metadata,
+				Exists:  true,
+				VMID:    existing.VMID,
+				State:   "running",
+				IPv4:    existing.IPv4,
+				SSHUser: existing.SSHUser,
 			}, nil
 		},
 	})

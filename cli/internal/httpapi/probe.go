@@ -8,8 +8,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/soctalk/launchpad/internal/pluginhost"
 	sdk "github.com/soctalk/launchpad-sdk-go"
+	"github.com/soctalk/launchpad/internal/pluginhost"
 )
 
 // ProbeResult is the outcome of a connectivity/credential check for a Host or

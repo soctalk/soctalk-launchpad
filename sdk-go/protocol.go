@@ -1,9 +1,10 @@
 // Package sdk implements the Launchpad plugin protocol (v1).
 //
 // Wire format: line-delimited JSON-RPC 2.0 on stdio.
-//   stdin  : launchpad -> plugin (requests + shutdown notification)
-//   stdout : plugin -> launchpad (RPC responses + progress/log notifications)
-//   stderr : unstructured human logs for developer eyes only; not parsed
+//
+//	stdin  : launchpad -> plugin (requests + shutdown notification)
+//	stdout : plugin -> launchpad (RPC responses + progress/log notifications)
+//	stderr : unstructured human logs for developer eyes only; not parsed
 //
 // Rules:
 //   - Exactly one compact UTF-8 JSON object per line (no pretty-printing).
@@ -12,11 +13,11 @@
 //     and the plugin will be killed by the parent.
 //
 // Handshake:
-//   1. Plugin emits "plugin.hello" notification (unsolicited) on start.
-//   2. Launchpad sends "plugin.initialize" request; plugin replies ok/err.
-//   3. Launchpad dispatches method requests one at a time per subprocess.
-//   4. Launchpad sends "plugin.shutdown" request; plugin flushes + replies;
-//      5s grace, then parent closes stdin, then SIGTERM, then SIGKILL.
+//  1. Plugin emits "plugin.hello" notification (unsolicited) on start.
+//  2. Launchpad sends "plugin.initialize" request; plugin replies ok/err.
+//  3. Launchpad dispatches method requests one at a time per subprocess.
+//  4. Launchpad sends "plugin.shutdown" request; plugin flushes + replies;
+//     5s grace, then parent closes stdin, then SIGTERM, then SIGKILL.
 package sdk
 
 const (
@@ -33,12 +34,12 @@ const (
 type (
 	// Envelope covers both requests and responses. Notifications omit ID.
 	Envelope struct {
-		JSONRPC string          `json:"jsonrpc"`
-		ID      *int64          `json:"id,omitempty"`
-		Method  string          `json:"method,omitempty"`
-		Params  any             `json:"params,omitempty"`
-		Result  any             `json:"result,omitempty"`
-		Error   *ProtocolError  `json:"error,omitempty"`
+		JSONRPC string         `json:"jsonrpc"`
+		ID      *int64         `json:"id,omitempty"`
+		Method  string         `json:"method,omitempty"`
+		Params  any            `json:"params,omitempty"`
+		Result  any            `json:"result,omitempty"`
+		Error   *ProtocolError `json:"error,omitempty"`
 	}
 )
 
@@ -69,24 +70,24 @@ type ErrorData struct {
 type ErrorCategory string
 
 const (
-	CatAuth               ErrorCategory = "auth"
-	CatValidation         ErrorCategory = "validation"
-	CatQuota              ErrorCategory = "quota"
-	CatRateLimited        ErrorCategory = "rate_limited"
-	CatTimeout            ErrorCategory = "timeout"
-	CatConflict           ErrorCategory = "conflict"
-	CatNotFound           ErrorCategory = "not_found"
+	CatAuth                ErrorCategory = "auth"
+	CatValidation          ErrorCategory = "validation"
+	CatQuota               ErrorCategory = "quota"
+	CatRateLimited         ErrorCategory = "rate_limited"
+	CatTimeout             ErrorCategory = "timeout"
+	CatConflict            ErrorCategory = "conflict"
+	CatNotFound            ErrorCategory = "not_found"
 	CatProviderUnavailable ErrorCategory = "provider_unavailable"
-	CatCancelled          ErrorCategory = "cancelled"
-	CatInternal           ErrorCategory = "internal"
+	CatCancelled           ErrorCategory = "cancelled"
+	CatInternal            ErrorCategory = "internal"
 )
 
 // RetryPolicy tells launchpad how to handle retry for this error.
 type RetryPolicy struct {
 	// Mode: "never", "immediate", "backoff", "manual" (operator decides).
-	Mode       string `json:"mode"`
-	AfterMS    int64  `json:"after_ms,omitempty"`     // suggested wait
-	MaxAttempts int   `json:"max_attempts,omitempty"` // 0 = unbounded
+	Mode        string `json:"mode"`
+	AfterMS     int64  `json:"after_ms,omitempty"`     // suggested wait
+	MaxAttempts int    `json:"max_attempts,omitempty"` // 0 = unbounded
 }
 
 // Standard JSON-RPC 2.0 error codes we use.
@@ -109,9 +110,9 @@ const (
 
 const (
 	// Plugin-initiated notifications (no response expected).
-	MethodHello    = "plugin.hello"    // sent once by plugin on start
-	MethodProgress = "progress"        // per-request progress updates
-	MethodLog      = "log"             // structured UI-facing log lines
+	MethodHello    = "plugin.hello" // sent once by plugin on start
+	MethodProgress = "progress"     // per-request progress updates
+	MethodLog      = "log"          // structured UI-facing log lines
 
 	// Launchpad-initiated requests to the plugin.
 	MethodInitialize = "plugin.initialize"
@@ -148,10 +149,10 @@ type HelloParams struct {
 
 // InitializeParams is the payload of the plugin.initialize request.
 type InitializeParams struct {
-	RunID      string         `json:"run_id"`
-	Config     map[string]any `json:"config"`
-	LogLevel   string         `json:"log_level"` // "debug" | "info" | "warn" | "error"
-	DryRun     bool           `json:"dry_run,omitempty"`
+	RunID    string         `json:"run_id"`
+	Config   map[string]any `json:"config"`
+	LogLevel string         `json:"log_level"` // "debug" | "info" | "warn" | "error"
+	DryRun   bool           `json:"dry_run,omitempty"`
 }
 
 // InitializeResult is what the plugin returns on successful initialize.
@@ -173,18 +174,18 @@ type ShutdownResult struct{}
 // VMSpec is the launchpad-authored desired-state for a VM. Plugins are
 // pass-throughs; they don't parse SocTalk config, they just apply the spec.
 type VMSpec struct {
-	RunID    string `json:"run_id"`     // required, correlates across methods
-	VMKey    string `json:"vm_key"`     // required, launchpad-authored stable identifier
-	Name     string `json:"name"`       // human-friendly display name
-	Region   string `json:"region"`     // provider-specific region ID
-	Image    string `json:"image"`      // provider-specific OS image ID
-	SizeHint string `json:"size_hint"`  // provider-specific plan/type
+	RunID    string `json:"run_id"`    // required, correlates across methods
+	VMKey    string `json:"vm_key"`    // required, launchpad-authored stable identifier
+	Name     string `json:"name"`      // human-friendly display name
+	Region   string `json:"region"`    // provider-specific region ID
+	Image    string `json:"image"`     // provider-specific OS image ID
+	SizeHint string `json:"size_hint"` // provider-specific plan/type
 
-	CPUs     int    `json:"cpus,omitempty"`     // fallback if size_hint empty
-	MemoryMB int    `json:"memory_mb,omitempty"`
-	DiskGB   int    `json:"disk_gb,omitempty"`
+	CPUs     int `json:"cpus,omitempty"` // fallback if size_hint empty
+	MemoryMB int `json:"memory_mb,omitempty"`
+	DiskGB   int `json:"disk_gb,omitempty"`
 
-	SSHKeys  []string          `json:"ssh_keys,omitempty"`  // authorized public keys
+	SSHKeys  []string          `json:"ssh_keys,omitempty"` // authorized public keys
 	Tags     map[string]string `json:"tags,omitempty"`
 	UserData string            `json:"user_data,omitempty"` // cloud-init user-data (raw)
 
@@ -200,9 +201,9 @@ type VMPlanParams struct {
 
 // VMPlanResult describes what would happen without side effects.
 type VMPlanResult struct {
-	Summary           string  `json:"summary"`
-	EstimatedCostUSD  float64 `json:"estimated_cost_usd,omitempty"`
-	EstimatedDurationSec int  `json:"estimated_duration_sec,omitempty"`
+	Summary              string  `json:"summary"`
+	EstimatedCostUSD     float64 `json:"estimated_cost_usd,omitempty"`
+	EstimatedDurationSec int     `json:"estimated_duration_sec,omitempty"`
 }
 
 // VMCreateParams triggers the actual provisioning.
@@ -213,13 +214,11 @@ type VMCreateParams struct {
 // VMCreateResult is the identity + address block returned after creation.
 // The VM may not be fully ready yet; caller should follow up with wait_ready.
 type VMCreateResult struct {
-	VMID       string            `json:"vm_id"`       // provider-native id
-	IPv4       string            `json:"ipv4,omitempty"`
-	IPv6       string            `json:"ipv6,omitempty"`
-	SSHUser    string            `json:"ssh_user"`
-	SSHPort    int               `json:"ssh_port,omitempty"` // default 22
-	ProviderURL string           `json:"provider_url,omitempty"` // cloud console link
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	VMID    string `json:"vm_id"` // provider-native id
+	IPv4    string `json:"ipv4,omitempty"`
+	IPv6    string `json:"ipv6,omitempty"`
+	SSHUser string `json:"ssh_user"`
+	SSHPort int    `json:"ssh_port,omitempty"` // default 22
 }
 
 // VMWaitReadyParams waits for the VM to be SSH-reachable + cloud-init done.
@@ -292,9 +291,9 @@ type ProgressParams struct {
 
 // LogParams is a structured log line the launchpad TUI surfaces to the operator.
 type LogParams struct {
-	OpID    int64             `json:"op_id,omitempty"`
-	VMKey   string            `json:"vm_key,omitempty"`
-	Level   string            `json:"level"` // "debug" | "info" | "warn" | "error"
-	Message string            `json:"message"`
-	Fields  map[string]any    `json:"fields,omitempty"`
+	OpID    int64          `json:"op_id,omitempty"`
+	VMKey   string         `json:"vm_key,omitempty"`
+	Level   string         `json:"level"` // "debug" | "info" | "warn" | "error"
+	Message string         `json:"message"`
+	Fields  map[string]any `json:"fields,omitempty"`
 }

@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/soctalk/launchpad/internal/orchestrator"
+	"github.com/soctalk/launchpad/internal/targetresolver"
 )
 
 // DownOptions is what the CLI parses out of flags for `launchpad down`.
@@ -29,7 +30,7 @@ func Down(opts DownOptions) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	manifests, err := resolveTargets(cfg)
+	manifests, err := targetresolver.Resolve(cfg)
 	if err != nil {
 		return fmt.Errorf("resolve plugin: %w", err)
 	}

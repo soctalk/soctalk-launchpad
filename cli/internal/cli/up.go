@@ -16,14 +16,14 @@ import (
 	yaml "gopkg.in/yaml.v3"
 
 	"github.com/soctalk/launchpad/internal/orchestrator"
-	"github.com/soctalk/launchpad/internal/pluginhost"
+	"github.com/soctalk/launchpad/internal/targetresolver"
 )
 
 // UpOptions is what the CLI parses out of flags.
 type UpOptions struct {
-	ConfigPath string
-	StatePath  string
-	Headless   bool // true → JSON events on stdout, commands on stdin
+	ConfigPath       string
+	StatePath        string
+	Headless         bool // true → JSON events on stdout, commands on stdin
 	AutoResolveGates bool // true → auto-resolve every gate (for scripted smoke tests)
 }
 
@@ -36,7 +36,7 @@ func Up(opts UpOptions) error {
 	}
 
 	// Resolve every plugin the run needs (top-level default + per-VM overrides).
-	manifests, err := resolveTargets(cfg)
+	manifests, err := targetresolver.Resolve(cfg)
 	if err != nil {
 		return fmt.Errorf("resolve plugin: %w", err)
 	}
@@ -97,52 +97,6 @@ func loadConfig(path string) (orchestrator.Config, error) {
 		cfg.MSSP.Role = "mssp"
 	}
 	return cfg, nil
-}
-
-func resolveManifest(nameOrPath string) (*pluginhost.Manifest, error) {
-	if strings.ContainsRune(nameOrPath, '/') || strings.ContainsRune(nameOrPath, '.') {
-		return pluginhost.LoadManifest(nameOrPath)
-	}
-	// A target may be a composed "platform@host" key; the plugin is selected by
-	// the platform half.
-	name := orchestrator.PlatformOfTarget(nameOrPath)
-	manifests, _ := pluginhost.DiscoverPlugins()
-	for _, m := range manifests {
-		if m.Name == name {
-			return m, nil
-		}
-	}
-	return nil, fmt.Errorf("plugin %q not found (check %s)", name, "launchpad plugin list")
-}
-
-// resolveTargets discovers manifests for every target the config references —
-// the top-level Config.Target plus any per-VM Target override. Returns a
-// map keyed by target name.
-func resolveTargets(cfg orchestrator.Config) (map[string]*pluginhost.Manifest, error) {
-	seen := map[string]struct{}{}
-	if cfg.Target != "" {
-		seen[cfg.Target] = struct{}{}
-	}
-	if t := cfg.MSSP.Target; t != "" {
-		seen[t] = struct{}{}
-	}
-	for _, tn := range cfg.Tenants {
-		if t := tn.Target; t != "" {
-			seen[t] = struct{}{}
-		}
-	}
-	if len(seen) == 0 {
-		return nil, fmt.Errorf("no target specified (set config.target or a per-VM target)")
-	}
-	out := map[string]*pluginhost.Manifest{}
-	for name := range seen {
-		m, err := resolveManifest(name)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
-		}
-		out[name] = m
-	}
-	return out, nil
 }
 
 func defaultStateDir() string {

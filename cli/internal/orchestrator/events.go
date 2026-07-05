@@ -12,12 +12,12 @@ type Event struct {
 	Time time.Time `json:"time"`
 
 	// The remaining fields are populated for specific event kinds.
-	Phase   PhaseName   `json:"phase,omitempty"`
-	VMKey   string      `json:"vm_key,omitempty"`
-	Step    string      `json:"step,omitempty"`
-	Percent float64     `json:"percent,omitempty"`
-	Message string      `json:"message,omitempty"`
-	Level   string      `json:"level,omitempty"`
+	Phase   PhaseName      `json:"phase,omitempty"`
+	VMKey   string         `json:"vm_key,omitempty"`
+	Step    string         `json:"step,omitempty"`
+	Percent float64        `json:"percent,omitempty"`
+	Message string         `json:"message,omitempty"`
+	Level   string         `json:"level,omitempty"`
 	Fields  map[string]any `json:"fields,omitempty"`
 
 	// GateOpen fields.
@@ -48,16 +48,16 @@ type EventError struct {
 type EventKind string
 
 const (
-	EvPhase         EventKind = "phase"
-	EvPluginReady   EventKind = "plugin_ready"
-	EvVMPlan        EventKind = "vm_plan"
-	EvVMProgress    EventKind = "vm_progress"
-	EvVMReady       EventKind = "vm_ready"
-	EvVMLog         EventKind = "vm_log"
-	EvGateOpen      EventKind = "gate_open"
-	EvGateResolved  EventKind = "gate_resolved"
-	EvError         EventKind = "error"
-	EvComplete      EventKind = "complete"
+	EvPhase        EventKind = "phase"
+	EvPluginReady  EventKind = "plugin_ready"
+	EvVMPlan       EventKind = "vm_plan"
+	EvVMProgress   EventKind = "vm_progress"
+	EvVMReady      EventKind = "vm_ready"
+	EvVMLog        EventKind = "vm_log"
+	EvGateOpen     EventKind = "gate_open"
+	EvGateResolved EventKind = "gate_resolved"
+	EvError        EventKind = "error"
+	EvComplete     EventKind = "complete"
 )
 
 // PhaseName is a coarse orchestration phase for progress display.

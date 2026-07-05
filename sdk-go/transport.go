@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -170,6 +169,3 @@ func ParseResult(env *Envelope, dst any) error {
 	}
 	return nil
 }
-
-// ErrEOF is returned when the peer has closed the stream cleanly.
-var ErrEOF = errors.New("peer closed")

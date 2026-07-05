@@ -32,9 +32,12 @@ type config struct {
 	Network string `json:"network,omitempty"`
 }
 
-var cfg config
+type provider struct {
+	cfg config
+}
 
 func main() {
+	p := &provider{}
 	err := sdk.Serve(sdk.Plugin{
 		Name:    name,
 		Version: version,
@@ -49,12 +52,12 @@ func main() {
 			"additionalProperties": false,
 		},
 
-		Initialize: initialize,
-		Plan:       plan,
-		Create:     create,
-		WaitReady:  waitReady,
-		Destroy:    destroy,
-		Inspect:    inspect,
+		Initialize: p.initialize,
+		Plan:       p.plan,
+		Create:     p.create,
+		WaitReady:  p.waitReady,
+		Destroy:    p.destroy,
+		Inspect:    p.inspect,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "docker plugin:", err)
@@ -62,18 +65,18 @@ func main() {
 	}
 }
 
-func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
+func (p *provider) initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
 	if raw, ok := params.Config["image"].(string); ok {
-		cfg.Image = raw
+		p.cfg.Image = raw
 	}
 	if raw, ok := params.Config["network"].(string); ok {
-		cfg.Network = raw
+		p.cfg.Network = raw
 	}
-	if cfg.Image == "" {
-		cfg.Image = "ubuntu:24.04"
+	if p.cfg.Image == "" {
+		p.cfg.Image = "ubuntu:24.04"
 	}
-	if cfg.Network == "" {
-		cfg.Network = "bridge"
+	if p.cfg.Network == "" {
+		p.cfg.Network = "bridge"
 	}
 	// Probe: docker version. Any non-zero exit means daemon is unreachable.
 	out, err := run(ctx, "docker", "version", "--format", "{{.Server.APIVersion}}")
@@ -85,14 +88,14 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 	return sdk.InitializeResult{Ready: true}, nil
 }
 
-func plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
+func (p *provider) plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
 	return sdk.VMPlanResult{
-		Summary:              fmt.Sprintf("docker: %s (image=%s network=%s)", params.Spec.Name, cfg.Image, cfg.Network),
+		Summary:              fmt.Sprintf("docker: %s (image=%s network=%s)", params.Spec.Name, p.cfg.Image, p.cfg.Network),
 		EstimatedDurationSec: 15,
 	}, nil
 }
 
-func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
+func (p *provider) create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
 	spec := params.Spec
 	emit.Progress("lookup", 5, "checking for existing container")
 	// Idempotent hit.
@@ -103,8 +106,8 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 		return inspectToCreateResult(ctx, id)
 	}
 
-	emit.Progress("image", 20, "pulling "+cfg.Image)
-	if _, err := run(ctx, "docker", "pull", cfg.Image); err != nil {
+	emit.Progress("image", 20, "pulling "+p.cfg.Image)
+	if _, err := run(ctx, "docker", "pull", p.cfg.Image); err != nil {
 		return sdk.VMCreateResult{}, sdk.Errf(sdk.CatProviderUnavailable,
 			"docker.pull_failed", "%v", err)
 	}
@@ -122,9 +125,9 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 		"--label", labelManaged + "=true",
 		"--hostname", firstNonEmpty(spec.Name, spec.VMKey),
 		"--publish", "127.0.0.1::22",
-		"--network", cfg.Network,
+		"--network", p.cfg.Network,
 		"--entrypoint", "bash",
-		cfg.Image,
+		p.cfg.Image,
 		"-c",
 		"echo " + entrypointB64 + " | base64 -d > /etc/lp-entrypoint.sh && chmod +x /etc/lp-entrypoint.sh && /etc/lp-entrypoint.sh",
 	}
@@ -138,14 +141,14 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	return inspectToCreateResult(ctx, id)
 }
 
-func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
+func (p *provider) waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
 	// Container is running as soon as `docker run -d` returns. Deeper checks
 	// (like SSH-dial) are the launchpad's job.
 	emit.Progress("wait_ready", 100, "container running")
 	return sdk.VMWaitReadyResult{Ready: true}, nil
 }
 
-func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
+func (p *provider) destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
 	id := params.VMID
 	if id == "" {
 		found, err := findByLabels(ctx, params.RunID, params.VMKey)
@@ -165,7 +168,7 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	return sdk.VMDestroyResult{Destroyed: true}, nil
 }
 
-func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
+func (p *provider) inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
 	id := params.VMID
 	if id == "" {
 		found, err := findByLabels(ctx, params.RunID, params.VMKey)
@@ -245,23 +248,10 @@ func inspectToCreateResult(ctx context.Context, id string) (sdk.VMCreateResult, 
 		VMID:    id,
 		SSHUser: "root",
 		SSHPort: 22,
-		Metadata: map[string]string{
-			"provider": "docker",
-		},
-	}
-	if info.Name != "" {
-		res.Metadata["container_name"] = strings.TrimPrefix(info.Name, "/")
 	}
 	if ip, port := dockerSSHBinding(info); ip != "" {
 		res.IPv4 = ip
 		res.SSHPort = port
-	}
-	// Internal container IP for other containers on the same network.
-	for _, ns := range info.NetworkSettings.Networks {
-		if ns.IPAddress != "" {
-			res.Metadata["internal_ipv4"] = ns.IPAddress
-			break
-		}
 	}
 	return res, nil
 }
@@ -274,7 +264,7 @@ type dockerInspectRaw struct {
 		Running bool   `json:"Running"`
 	} `json:"State"`
 	NetworkSettings struct {
-		Ports    map[string][]struct {
+		Ports map[string][]struct {
 			HostIP   string `json:"HostIp"`
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`

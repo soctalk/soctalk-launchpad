@@ -11,12 +11,12 @@ import (
 // State is the persistent record of what the orchestrator has done. Written
 // on every event so a killed launchpad can resume.
 type State struct {
-	mu      sync.Mutex
-	path    string
-	RunID   string             `json:"run_id"`
-	Target  string             `json:"target"`
-	VMs     map[string]StateVM `json:"vms"`
-	Events  []Event            `json:"events"`
+	mu     sync.Mutex
+	path   string
+	RunID  string             `json:"run_id"`
+	Target string             `json:"target"`
+	VMs    map[string]StateVM `json:"vms"`
+	Events []Event            `json:"events"`
 	// GateResolved tracks manual gates already confirmed, so a resumed
 	// run doesn't re-prompt.
 	GateResolved map[string]bool `json:"gate_resolved"`
@@ -66,20 +66,23 @@ func LoadOrInit(path, runID, target string) (*State, error) {
 	}, nil
 }
 
-func (s *State) SetVM(key string, vm StateVM) {
+// SetVM records a VM and persists state. The error must not be ignored on the
+// provisioning path: a VM created but not persisted is invisible to resume and
+// teardown while the resource keeps running.
+func (s *State) SetVM(key string, vm StateVM) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.VMs[key] = vm
-	_ = s.saveLocked()
+	return s.saveLocked()
 }
 
 // DeleteVM drops a VM from state — used when resume validation finds the
 // recorded VM gone or unreachable and the orchestrator re-provisions.
-func (s *State) DeleteVM(key string) {
+func (s *State) DeleteVM(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.VMs, key)
-	_ = s.saveLocked()
+	return s.saveLocked()
 }
 
 func (s *State) GetVM(key string) (StateVM, bool) {
@@ -89,7 +92,7 @@ func (s *State) GetVM(key string) (StateVM, bool) {
 	return vm, ok
 }
 
-func (s *State) RecordEvent(ev Event) {
+func (s *State) RecordEvent(ev Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Events = append(s.Events, ev)
@@ -97,14 +100,14 @@ func (s *State) RecordEvent(ev Event) {
 	if len(s.Events) > 2000 {
 		s.Events = s.Events[len(s.Events)-2000:]
 	}
-	_ = s.saveLocked()
+	return s.saveLocked()
 }
 
-func (s *State) MarkGateResolved(id string) {
+func (s *State) MarkGateResolved(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.GateResolved[id] = true
-	_ = s.saveLocked()
+	return s.saveLocked()
 }
 
 // saveLocked is the on-disk write path. Callers must hold s.mu.

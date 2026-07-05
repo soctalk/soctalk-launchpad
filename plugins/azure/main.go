@@ -12,30 +12,26 @@
 // order (VM, NIC, public IP, plugin-created VNet).
 //
 // Config (from launchpad, via plugin.initialize params.config):
-//   subscription_id: Azure subscription (default env AZURE_SUBSCRIPTION_ID)
-//   resource_group:  target resource group (required at create time)
-//   location:        Azure region (default "eastus")
-//   vm_size:         VM size (default "Standard_B2s")
-//   image:           Marketplace image URN (default Ubuntu 24.04)
-//   admin_user:      Linux admin username (default "ops")
-//   tailnet:         optional tailnet hint (used as tailscale hostname suffix)
-//   ssh_keys:        additional authorized public keys ([]string)
+//
+//	subscription_id: Azure subscription (default env AZURE_SUBSCRIPTION_ID)
+//	resource_group:  target resource group (required at create time)
+//	location:        Azure region (default "eastus")
+//	vm_size:         VM size (default "Standard_B2s")
+//	image:           Marketplace image URN (default Ubuntu 24.04)
+//	admin_user:      Linux admin username (default "ops")
+//	tailnet:         optional tailnet hint (used as tailscale hostname suffix)
+//	ssh_keys:        additional authorized public keys ([]string)
 //
 // Env:
-//   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET / AZURE_SUBSCRIPTION_ID
-//   TAILSCALE_API_KEY (auth key used by cloud-init to join the tailnet)
+//
+//	AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET / AZURE_SUBSCRIPTION_ID
+//	TAILSCALE_API_KEY (auth key used by cloud-init to join the tailnet)
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -46,6 +42,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	sdk "github.com/soctalk/launchpad-sdk-go"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/cloudinit"
+	"github.com/soctalk/launchpad-sdk-go/pluginutil/tailscale"
 )
 
 const (
@@ -82,6 +80,11 @@ type config struct {
 type plugin struct {
 	cfg config
 
+	// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
+	// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
+	// the Network resource).
+	tsAPIKey string
+
 	cred      *azidentity.DefaultAzureCredential
 	vms       *armcompute.VirtualMachinesClient
 	nics      *armnetwork.InterfacesClient
@@ -90,14 +93,8 @@ type plugin struct {
 	subnets   *armnetwork.SubnetsClient
 }
 
-var p plugin
-
-// tsAPIKey is the Tailscale API key used to mint ephemeral device auth keys.
-// Set once in initialize from the TAILSCALE_API_KEY env (injected per-run from
-// the Network resource).
-var tsAPIKey string
-
 func main() {
+	p := &plugin{}
 	err := sdk.Serve(sdk.Plugin{
 		Name:    name,
 		Version: version,
@@ -132,12 +129,12 @@ func main() {
 			"additionalProperties": false,
 		},
 
-		Initialize: initialize,
-		Plan:       plan,
-		Create:     create,
-		WaitReady:  waitReady,
-		Destroy:    destroy,
-		Inspect:    inspect,
+		Initialize: p.initialize,
+		Plan:       p.plan,
+		Create:     p.create,
+		WaitReady:  p.waitReady,
+		Destroy:    p.destroy,
+		Inspect:    p.inspect,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "azure plugin:", err)
@@ -145,7 +142,7 @@ func main() {
 	}
 }
 
-func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
+func (p *plugin) initialize(ctx context.Context, params sdk.InitializeParams) (sdk.InitializeResult, error) {
 	cfg := config{
 		Location:  defaultLocation,
 		VMSize:    defaultVMSize,
@@ -202,7 +199,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 
 	// Tailscale API key: injected per-run from the Network resource. Required to
 	// mint the ephemeral device auth key baked into the VM's cloud-init.
-	tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
+	p.tsAPIKey = os.Getenv("TAILSCALE_API_KEY")
 
 	if cfg.SubscriptionID == "" {
 		return sdk.InitializeResult{}, sdk.Errf(sdk.CatAuth,
@@ -266,7 +263,7 @@ func initialize(ctx context.Context, params sdk.InitializeParams) (sdk.Initializ
 // plan / validation
 // ------------------------------------------------------------------
 
-func resolveSpec(spec *sdk.VMSpec) {
+func (p *plugin) resolveSpec(spec *sdk.VMSpec) {
 	if spec.Region == "" {
 		spec.Region = p.cfg.Location
 	}
@@ -282,9 +279,9 @@ func resolveSpec(spec *sdk.VMSpec) {
 	}
 }
 
-func plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
+func (p *plugin) plan(ctx context.Context, params sdk.VMPlanParams, emit sdk.Emitter) (sdk.VMPlanResult, error) {
 	spec := params.Spec
-	resolveSpec(&spec)
+	p.resolveSpec(&spec)
 	if err := validateSpec(spec); err != nil {
 		return sdk.VMPlanResult{}, err
 	}
@@ -315,7 +312,7 @@ func validateSpec(spec sdk.VMSpec) error {
 	return nil
 }
 
-func requireClients() error {
+func (p *plugin) requireClients() error {
 	if p.vms == nil {
 		return sdk.Errf(sdk.CatAuth,
 			"azure.not_initialized",
@@ -324,7 +321,7 @@ func requireClients() error {
 	return nil
 }
 
-func requireResourceGroup() error {
+func (p *plugin) requireResourceGroup() error {
 	if p.cfg.ResourceGroup == "" {
 		return sdk.Errf(sdk.CatValidation, "azure.config.missing_resource_group",
 			"resource_group must be set in plugin config")
@@ -336,15 +333,15 @@ func requireResourceGroup() error {
 // create
 // ------------------------------------------------------------------
 
-func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
-	if err := requireClients(); err != nil {
+func (p *plugin) create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (sdk.VMCreateResult, error) {
+	if err := p.requireClients(); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
-	if err := requireResourceGroup(); err != nil {
+	if err := p.requireResourceGroup(); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 	spec := params.Spec
-	resolveSpec(&spec)
+	p.resolveSpec(&spec)
 	if err := validateSpec(spec); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
@@ -353,7 +350,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	base := resourceName(spec.RunID, spec.VMKey)
 
 	emit.Progress("lookup", 5, "checking for existing VM")
-	if existing, err := findVMByTags(ctx, spec.RunID, spec.VMKey); err != nil {
+	if existing, err := p.findVMByTags(ctx, spec.RunID, spec.VMKey); err != nil {
 		return sdk.VMCreateResult{}, sdk.Errf(sdk.CatInternal,
 			"azure.list_failed", "listing existing VMs: %v", err)
 	} else if existing != nil {
@@ -362,7 +359,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 		if addr, err := p.getPublicIPAddress(ctx, base+"-ip"); err == nil {
 			ip = addr
 		}
-		return vmToCreateResult(existing, ip), nil
+		return p.vmToCreateResult(existing, ip), nil
 	}
 
 	tags := baseTags(spec)
@@ -371,14 +368,14 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	// Tailscale and joins the tailnet on first boot. The orchestrator then
 	// resolves this VM by its tailnet hostname (lp-<vmKey>).
 	emit.Progress("tailscale", 10, "minting device auth key")
-	tag := tailscaleTagForSpec(spec)
-	tskey, err := mintTailscaleKey(ctx, p.cfg.Tailnet, tag)
+	tag := tailscale.TagForSpec(spec, p.cfg.TagPrefix)
+	tskey, err := tailscale.MintKey(ctx, p.cfg.Tailnet, tag)
 	if err != nil {
 		return sdk.VMCreateResult{}, err
 	}
-	customData := base64.StdEncoding.EncodeToString([]byte(composeUserData(cloudInitInputs{
-		Hostname:      hostnameFor(spec.VMKey),
-		SSHKeys:       mergeSSHKeys(p.cfg.SSHKeys, spec.SSHKeys),
+	customData := base64.StdEncoding.EncodeToString([]byte(cloudinit.Compose(cloudinit.Inputs{
+		Hostname:      tailscale.Hostname(spec.VMKey),
+		SSHKeys:       cloudinit.MergeSSHKeys(p.cfg.SSHKeys, spec.SSHKeys),
 		TailscaleKey:  tskey,
 		TailscaleTag:  tag,
 		ExtraUserData: spec.UserData,
@@ -416,7 +413,7 @@ func create(ctx context.Context, params sdk.VMCreateParams, emit sdk.Emitter) (s
 	ip, _ := p.getPublicIPAddress(ctx, base+"-ip")
 
 	emit.Progress("create", 100, "VM created")
-	return vmToCreateResult(vm, ip), nil
+	return p.vmToCreateResult(vm, ip), nil
 }
 
 // ensureSubnet creates the shared lp-vnet + lp-subnet if absent and returns the
@@ -607,11 +604,11 @@ func (pl *plugin) createVM(ctx context.Context, rg string, spec sdk.VMSpec, base
 // wait_ready
 // ------------------------------------------------------------------
 
-func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
-	if err := requireClients(); err != nil {
+func (p *plugin) waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitter) (sdk.VMWaitReadyResult, error) {
+	if err := p.requireClients(); err != nil {
 		return sdk.VMWaitReadyResult{}, err
 	}
-	if err := requireResourceGroup(); err != nil {
+	if err := p.requireResourceGroup(); err != nil {
 		return sdk.VMWaitReadyResult{}, err
 	}
 	rg := p.cfg.ResourceGroup
@@ -650,11 +647,11 @@ func waitReady(ctx context.Context, params sdk.VMWaitReadyParams, emit sdk.Emitt
 // destroy
 // ------------------------------------------------------------------
 
-func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
-	if err := requireClients(); err != nil {
+func (p *plugin) destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) (sdk.VMDestroyResult, error) {
+	if err := p.requireClients(); err != nil {
 		return sdk.VMDestroyResult{}, err
 	}
-	if err := requireResourceGroup(); err != nil {
+	if err := p.requireResourceGroup(); err != nil {
 		return sdk.VMDestroyResult{}, err
 	}
 	rg := p.cfg.ResourceGroup
@@ -668,7 +665,7 @@ func destroy(ctx context.Context, params sdk.VMDestroyParams, emit sdk.Emitter) 
 	existed := false
 	if _, err := p.vms.Get(ctx, rg, base, nil); err == nil {
 		existed = true
-	} else if found, ferr := findVMByTags(ctx, params.RunID, params.VMKey); ferr == nil && found != nil {
+	} else if found, ferr := p.findVMByTags(ctx, params.RunID, params.VMKey); ferr == nil && found != nil {
 		existed = true
 		base = *found.Name
 	}
@@ -739,11 +736,11 @@ func (pl *plugin) deletePublicIP(ctx context.Context, rg, ipName string) error {
 // inspect
 // ------------------------------------------------------------------
 
-func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
-	if err := requireClients(); err != nil {
+func (p *plugin) inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) (sdk.VMInspectResult, error) {
+	if err := p.requireClients(); err != nil {
 		return sdk.VMInspectResult{}, err
 	}
-	if err := requireResourceGroup(); err != nil {
+	if err := p.requireResourceGroup(); err != nil {
 		return sdk.VMInspectResult{}, err
 	}
 	rg := p.cfg.ResourceGroup
@@ -757,7 +754,7 @@ func inspect(ctx context.Context, params sdk.VMInspectParams, emit sdk.Emitter) 
 	if err != nil {
 		if isNotFound(err) {
 			// Try tag-based lookup as a fallback.
-			if found, ferr := findVMByTags(ctx, params.RunID, params.VMKey); ferr == nil && found != nil {
+			if found, ferr := p.findVMByTags(ctx, params.RunID, params.VMKey); ferr == nil && found != nil {
 				base = *found.Name
 				got, err = p.vms.Get(ctx, rg, base, nil)
 			}
@@ -804,7 +801,7 @@ func baseTags(spec sdk.VMSpec) map[string]*string {
 }
 
 // findVMByTags locates a VM previously created for this (run_id, vm_key).
-func findVMByTags(ctx context.Context, runID, vmKey string) (*armcompute.VirtualMachine, error) {
+func (p *plugin) findVMByTags(ctx context.Context, runID, vmKey string) (*armcompute.VirtualMachine, error) {
 	pager := p.vms.NewListPager(p.cfg.ResourceGroup, nil)
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
@@ -862,29 +859,13 @@ func (pl *plugin) getPublicIPAddress(ctx context.Context, ipName string) (string
 	return "", nil
 }
 
-func vmToCreateResult(vm *armcompute.VirtualMachine, ip string) sdk.VMCreateResult {
-	vmName := derefStr(vm.Name)
-	loc := derefStr(vm.Location)
-	size := ""
-	if vm.Properties != nil && vm.Properties.HardwareProfile != nil && vm.Properties.HardwareProfile.VMSize != nil {
-		size = string(*vm.Properties.HardwareProfile.VMSize)
-	}
-	res := sdk.VMCreateResult{
-		VMID:    vmName,
+func (p *plugin) vmToCreateResult(vm *armcompute.VirtualMachine, ip string) sdk.VMCreateResult {
+	return sdk.VMCreateResult{
+		VMID:    derefStr(vm.Name),
 		IPv4:    ip,
 		SSHUser: p.cfg.AdminUser,
 		SSHPort: 22,
-		Metadata: map[string]string{
-			"provider":       "azure",
-			"resource_group": p.cfg.ResourceGroup,
-			"location":       loc,
-			"vm_size":        size,
-		},
 	}
-	if vm.ID != nil {
-		res.ProviderURL = "https://portal.azure.com/#@/resource" + *vm.ID
-	}
-	return res
 }
 
 // parseImageURN splits "Publisher:Offer:SKU:Version" into an ImageReference.
@@ -900,155 +881,6 @@ func parseImageURN(urn string) (*armcompute.ImageReference, error) {
 		SKU:       to.Ptr(parts[2]),
 		Version:   to.Ptr(parts[3]),
 	}, nil
-}
-
-// --- Tailscale join + cloud-init composition -------------------------------
-// Ported from the qemu-family plugins: cloud VMs join the tailnet on first boot
-// via a plugin-minted ephemeral auth key baked into cloud-init. The orchestrator
-// discovers each VM by its tailnet hostname (lp-<vmKey>) rather than a public IP.
-
-type cloudInitInputs struct {
-	Hostname      string
-	SSHKeys       []string
-	TailscaleKey  string
-	TailscaleTag  string
-	ExtraUserData string
-}
-
-// composeUserData builds a #cloud-config that provisions the ops user, installs
-// Tailscale, and joins the tailnet with the minted auth key.
-func composeUserData(in cloudInitInputs) string {
-	var b bytes.Buffer
-	b.WriteString("#cloud-config\n")
-	fmt.Fprintf(&b, "hostname: %s\n", in.Hostname)
-	b.WriteString("manage_etc_hosts: true\n")
-	b.WriteString("users:\n")
-	b.WriteString("  - default\n")
-	b.WriteString("  - name: ops\n")
-	b.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
-	b.WriteString("    shell: /bin/bash\n")
-	if len(in.SSHKeys) > 0 {
-		b.WriteString("    ssh_authorized_keys:\n")
-		for _, k := range in.SSHKeys {
-			fmt.Fprintf(&b, "      - %s\n", k)
-		}
-	}
-	b.WriteString("package_update: true\n")
-	b.WriteString("packages: [curl, ca-certificates, jq]\n")
-	b.WriteString("runcmd:\n")
-	b.WriteString("  - curl -fsSL https://tailscale.com/install.sh | sh\n")
-	fmt.Fprintf(&b,
-		"  - tailscale up --auth-key=%q --advertise-tags=%s --hostname=%s\n",
-		in.TailscaleKey, in.TailscaleTag, in.Hostname)
-	if in.ExtraUserData != "" {
-		for _, line := range strings.Split(strings.TrimSpace(in.ExtraUserData), "\n") {
-			fmt.Fprintf(&b, "  - %s\n", line)
-		}
-	}
-	return b.String()
-}
-
-// mintTailscaleKey creates a single-use, ephemeral, pre-authorized device auth
-// key tagged for this VM. Requires TAILSCALE_API_KEY (tsAPIKey).
-func mintTailscaleKey(ctx context.Context, tailnet, tag string) (string, error) {
-	if tailnet == "" {
-		return "", sdk.Errf(sdk.CatValidation, "azure.tailscale.no_tailnet", "tailnet is empty")
-	}
-	if tsAPIKey == "" {
-		return "", sdk.Errf(sdk.CatAuth, "azure.tailscale.no_api_key",
-			"TAILSCALE_API_KEY is required for minting device auth keys")
-	}
-	payload := map[string]any{
-		"capabilities": map[string]any{
-			"devices": map[string]any{
-				"create": map[string]any{
-					"reusable":      false,
-					"ephemeral":     true,
-					"preauthorized": true,
-					"tags":          []string{tag},
-				},
-			},
-		},
-		"expirySeconds": 3600,
-	}
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/keys", tailnet)
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(tsAPIKey, "")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", sdk.Errf(sdk.CatProviderUnavailable, "azure.tailscale.api_error", "%v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", sdk.Errf(sdk.CatAuth, "azure.tailscale.api_status",
-			"tailscale API %d: %s", resp.StatusCode, string(raw))
-	}
-	var out struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", err
-	}
-	if out.Key == "" {
-		return "", sdk.Errf(sdk.CatInternal, "azure.tailscale.key_missing",
-			"no key in tailscale response: %s", string(raw))
-	}
-	return out.Key, nil
-}
-
-// tailscaleTagForSpec derives the advertised tag from the VM role/slug so the
-// tailnet ACL can group MSSP and tenant devices. Matches the qemu/vmware plugins.
-func tailscaleTagForSpec(spec sdk.VMSpec) string {
-	prefix := p.cfg.TagPrefix
-	role := spec.Tags["role"]
-	slug := spec.Tags["tenant_slug"]
-	if role == "mssp" {
-		return "tag:" + prefix + "mssp"
-	}
-	if role == "tenant" && slug != "" {
-		return "tag:" + prefix + "tenant-" + slug
-	}
-	return "tag:" + prefix + "lp-" + spec.VMKey
-}
-
-func hostnameFor(vmKey string) string {
-	return "lp-" + sanitizeHostname(vmKey)
-}
-
-func sanitizeHostname(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 40 {
-		out = out[:40]
-	}
-	if out == "" {
-		buf := make([]byte, 4)
-		_, _ = rand.Read(buf)
-		out = "lp-" + hex.EncodeToString(buf)
-	}
-	return out
-}
-
-func mergeSSHKeys(a, b []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(a)+len(b))
-	for _, k := range append(append([]string{}, a...), b...) {
-		if k = strings.TrimSpace(k); k != "" && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	return out
 }
 
 // resourceName builds the "lp-<runID>-<vmKey>" base name, sanitized for Azure.

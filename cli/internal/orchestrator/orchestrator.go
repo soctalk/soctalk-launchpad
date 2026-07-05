@@ -2,8 +2,8 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -20,7 +20,7 @@ import (
 // Target + PluginConfig. The orchestrator lazily starts one plugin
 // subprocess per distinct target and keeps them alive for the whole run.
 type Orchestrator struct {
-	cfg      Config
+	cfg       Config
 	manifests map[string]*pluginhost.Manifest // resolved by target name
 	// extraEnv holds secret env vars to inject into each target's plugin
 	// subprocess (keyed by target name): ESXi creds from the host, the
@@ -38,6 +38,8 @@ type Orchestrator struct {
 
 	// state file — persisted on every event. See state.go.
 	state *State
+	// persistWarn ensures a failing state file is reported only once.
+	persistWarn sync.Once
 
 	// runtime-only: subprocess clients, one per plugin target in use.
 	clientsMu sync.Mutex
@@ -228,7 +230,9 @@ func (o *Orchestrator) createVM(ctx context.Context, s VMSpec) error {
 		icancel()
 		if ierr == nil && ir.Exists && ir.State == "running" && ir.IPv4 != "" {
 			existing.IPv4 = ir.IPv4
-			o.state.SetVM(s.Key, existing)
+			if err := o.state.SetVM(s.Key, existing); err != nil {
+				return fmt.Errorf("persist resumed VM %s: %w", s.Key, err)
+			}
 			o.emit(Event{Ev: EvVMLog, VMKey: s.Key, Level: "info",
 				Message: fmt.Sprintf("resuming: VM already provisioned and reachable (id=%s, ip=%s)", existing.VMID, ir.IPv4)})
 			o.emit(Event{Ev: EvVMReady, VMKey: s.Key, IPv4: existing.IPv4, SSHUser: existing.SSHUser, SSHPort: existing.SSHPort})
@@ -244,7 +248,7 @@ func (o *Orchestrator) createVM(ctx context.Context, s VMSpec) error {
 			Selector: map[string]string{"run_id": o.cfg.RunID, "vm_key": s.Key},
 		}, &dr)
 		dcancel()
-		o.state.DeleteVM(s.Key)
+		_ = o.state.DeleteVM(s.Key) // best-effort cleanup before re-provision
 	}
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Minute)
 	defer cancel()
@@ -253,10 +257,14 @@ func (o *Orchestrator) createVM(ctx context.Context, s VMSpec) error {
 	if err != nil {
 		return err
 	}
-	o.state.SetVM(s.Key, StateVM{
+	if err := o.state.SetVM(s.Key, StateVM{
 		VMID: res.VMID, IPv4: res.IPv4, IPv6: res.IPv6, SSHUser: res.SSHUser, SSHPort: res.SSHPort,
 		Target: s.EffectiveTarget(o.cfg.Target),
-	})
+	}); err != nil {
+		// The VM exists but wasn't recorded — fail loudly with its id so the
+		// operator can reconcile rather than leak an untracked resource.
+		return fmt.Errorf("VM %s created (id=%s) but state persist failed: %w", s.Key, res.VMID, err)
+	}
 	// Provisioned, but not necessarily reachable yet — for qemu/vmware the
 	// address is only discovered during wait_ready, so hold the vm_ready event
 	// until then (a premature vm_ready with an empty IP misleads UI/headless
@@ -284,7 +292,9 @@ func (o *Orchestrator) createVM(ctx context.Context, s VMSpec) error {
 	if wres.IPv6 != "" {
 		ready.IPv6 = wres.IPv6
 	}
-	o.state.SetVM(s.Key, ready)
+	if err := o.state.SetVM(s.Key, ready); err != nil {
+		return fmt.Errorf("persist VM %s readiness: %w", s.Key, err)
+	}
 	// Authoritative vm_ready: emitted only once the VM is reachable, with the
 	// final address.
 	o.emit(Event{Ev: EvVMReady, VMKey: s.Key, IPv4: ready.IPv4, IPv6: ready.IPv6,
@@ -307,7 +317,8 @@ func (o *Orchestrator) openGate(ctx context.Context, id, instructions, copyText 
 	o.emit(Event{Ev: EvGateOpen, GateID: id, Instructions: instructions, CopyText: copyText})
 	select {
 	case <-ch:
-		o.state.MarkGateResolved(id)
+		// Best-effort: a failed persist only costs a re-prompt on resume.
+		_ = o.state.MarkGateResolved(id)
 		o.emit(Event{Ev: EvGateResolved, GateID: id})
 		return nil
 	case <-ctx.Done():
@@ -363,7 +374,13 @@ func (o *Orchestrator) emit(ev Event) {
 		ev.Time = time.Now().UTC()
 	}
 	if o.state != nil {
-		o.state.RecordEvent(ev)
+		if err := o.state.RecordEvent(ev); err != nil {
+			// The event log is a capped diagnostic, not authoritative state, so
+			// don't fail the run — but surface a broken state file once.
+			o.persistWarn.Do(func() {
+				fmt.Fprintf(os.Stderr, "warning: launchpad state persistence is failing: %v\n", err)
+			})
+		}
 	}
 	select {
 	case o.events <- ev:
@@ -378,9 +395,6 @@ func (o *Orchestrator) fail(msg string) {
 	}})
 	o.emit(Event{Ev: EvPhase, Phase: PhaseFailed})
 }
-
-// ErrCancelled is returned when the orchestrator is cancelled.
-var ErrCancelled = errors.New("orchestration cancelled")
 
 // toSDKSpec builds the plugin-facing VMSpec. Role and TenantSlug are
 // first-class launchpad fields but plugins only see the tags map, so fold

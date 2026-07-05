@@ -41,7 +41,13 @@ func (o *Orchestrator) runInstall(ctx context.Context) error {
 		return nil
 	}
 
+	// All VMs in a run share the run's network tailnet. Prefer the top-level
+	// plugin_config, but fall back to the MSSP's per-VM config so a mixed-target
+	// run (which may only set per-VM plugin_config) still resolves it.
 	tailnet, _ := o.cfg.PluginConfig["tailnet"].(string)
+	if tailnet == "" {
+		tailnet, _ = o.cfg.MSSP.PluginConfig["tailnet"].(string)
+	}
 	if tailnet == "" {
 		return fmt.Errorf("cannot resolve tailnet from plugin_config")
 	}

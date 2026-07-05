@@ -8,13 +8,12 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/soctalk/launchpad/internal/eventjournal"
 	"github.com/soctalk/launchpad/internal/orchestrator"
-	"github.com/soctalk/launchpad/internal/pluginhost"
+	"github.com/soctalk/launchpad/internal/targetresolver"
 )
 
 // Status is the coarse run state exposed to clients.
@@ -55,16 +54,16 @@ type Run struct {
 
 // Snapshot is the JSON-friendly view of a run.
 type Snapshot struct {
-	ID        string               `json:"id"`
-	Status    Status               `json:"status"`
-	Error     string               `json:"error,omitempty"`
-	Phase     string               `json:"phase"`
-	StartedAt time.Time            `json:"started_at"`
-	EndedAt   *time.Time           `json:"ended_at,omitempty"`
-	LastSeq   int64                `json:"last_seq"`
-	VMs       []VMSnapshot         `json:"vms"`
-	Gates     []GateSnapshot       `json:"gates"`
-	Config    orchestrator.Config  `json:"config"`
+	ID        string              `json:"id"`
+	Status    Status              `json:"status"`
+	Error     string              `json:"error,omitempty"`
+	Phase     string              `json:"phase"`
+	StartedAt time.Time           `json:"started_at"`
+	EndedAt   *time.Time          `json:"ended_at,omitempty"`
+	LastSeq   int64               `json:"last_seq"`
+	VMs       []VMSnapshot        `json:"vms"`
+	Gates     []GateSnapshot      `json:"gates"`
+	Config    orchestrator.Config `json:"config"`
 }
 
 type VMSnapshot struct {
@@ -118,7 +117,7 @@ func (m *Manager) Start(cfg orchestrator.Config, extraEnv map[string][]string) (
 		}
 	}
 
-	manifests, err := resolveTargets(cfg)
+	manifests, err := targetresolver.Resolve(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +137,7 @@ func (m *Manager) Start(cfg orchestrator.Config, extraEnv map[string][]string) (
 		ID: cfg.RunID, Cfg: cfg, Journal: journal, StartedAt: time.Now().UTC(),
 		extraEnv: extraEnv,
 		status:   StatusRunning, cancel: cancel, orch: orch, state: state,
-		gates:    map[string]string{},
+		gates: map[string]string{},
 	}
 	m.mu.Lock()
 	m.runs[cfg.RunID] = run
@@ -294,7 +293,7 @@ func (m *Manager) Down(runID string) error {
 	r.status = StatusTearingDown
 	r.mu.Unlock()
 
-	manifests, err := resolveTargets(r.Cfg)
+	manifests, err := targetresolver.Resolve(r.Cfg)
 	if err != nil {
 		return err
 	}
@@ -348,49 +347,4 @@ func tailnetOf(cfg orchestrator.Config) string {
 		return v
 	}
 	return ""
-}
-
-// resolveTargets mirrors internal/cli.resolveTargets (kept separate to avoid
-// an import cycle through the command layer).
-func resolveTargets(cfg orchestrator.Config) (map[string]*pluginhost.Manifest, error) {
-	seen := map[string]struct{}{}
-	if cfg.Target != "" {
-		seen[cfg.Target] = struct{}{}
-	}
-	if t := cfg.MSSP.Target; t != "" {
-		seen[t] = struct{}{}
-	}
-	for _, tn := range cfg.Tenants {
-		if t := tn.Target; t != "" {
-			seen[t] = struct{}{}
-		}
-	}
-	if len(seen) == 0 {
-		return nil, fmt.Errorf("no target specified")
-	}
-	out := map[string]*pluginhost.Manifest{}
-	for name := range seen {
-		m, err := resolveManifest(name)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
-		}
-		out[name] = m
-	}
-	return out, nil
-}
-
-func resolveManifest(nameOrPath string) (*pluginhost.Manifest, error) {
-	if strings.ContainsRune(nameOrPath, '/') || strings.ContainsRune(nameOrPath, '.') {
-		return pluginhost.LoadManifest(nameOrPath)
-	}
-	// A target may be a composed "platform@host" key; the plugin is selected by
-	// the platform half.
-	name := orchestrator.PlatformOfTarget(nameOrPath)
-	manifests, _ := pluginhost.DiscoverPlugins()
-	for _, m := range manifests {
-		if m.Name == name {
-			return m, nil
-		}
-	}
-	return nil, fmt.Errorf("plugin %q not found", name)
 }

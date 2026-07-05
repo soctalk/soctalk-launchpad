@@ -54,15 +54,6 @@ func TestDiscoverProvenanceAndShadowing(t *testing.T) {
 	if got["mock"] == nil || got["mock"].Provenance != ProvenanceDev {
 		t.Errorf("mock provenance = %v, want dev", got["mock"])
 	}
-
-	for _, m := range Trusted(ms) {
-		if m.Provenance == ProvenanceDev {
-			t.Errorf("dev plugin %q leaked into Trusted() without opt-in", m.Name)
-		}
-	}
-	if n := len(Trusted(ms)); n != 1 {
-		t.Errorf("Trusted() = %d plugins, want 1 (managed qemu only)", n)
-	}
 }
 
 // With unsigned plugins explicitly allowed, a dev build overrides the managed
@@ -85,8 +76,5 @@ func TestDiscoverAllowUnsigned(t *testing.T) {
 	got := byName(ms)
 	if got["qemu"] == nil || got["qemu"].Provenance != ProvenanceDev {
 		t.Errorf("with allow-unsigned, qemu provenance = %v, want dev (override)", got["qemu"])
-	}
-	if len(Trusted(ms)) != len(ms) {
-		t.Errorf("with allow-unsigned, all %d plugins should be trusted, got %d", len(ms), len(Trusted(ms)))
 	}
 }

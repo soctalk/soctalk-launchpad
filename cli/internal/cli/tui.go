@@ -211,7 +211,7 @@ func (m tuiModel) View() string {
 
 	// Gate prompt.
 	if m.gateOpen != nil {
-		b.WriteString(styleGate.Render("gate: " + m.gateOpen.GateID) + "\n")
+		b.WriteString(styleGate.Render("gate: "+m.gateOpen.GateID) + "\n")
 		b.WriteString("  " + m.gateOpen.Instructions + "\n")
 		if m.gateOpen.CopyText != "" {
 			b.WriteString(styleDim.Render("  copy:") + " " + m.gateOpen.CopyText + "\n")
