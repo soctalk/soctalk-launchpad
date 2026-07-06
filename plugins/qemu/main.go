@@ -28,6 +28,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"strings"
 	"time"
@@ -69,6 +70,80 @@ type config struct {
 // defaultBaseImageURL is Canonical's current Ubuntu Noble amd64 cloud image.
 // It is rebuilt periodically; pin base_image_sha256 in config to freeze.
 const defaultBaseImageURL = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+
+// --- Inter-VM LAN ---------------------------------------------------------
+//
+// A VM's primary NIC is SLIRP user-mode NAT: great for reaching the internet,
+// but SLIRP isolates each guest behind its own NAT with no guest-to-guest path.
+// Two VMs on the same host therefore can't reach each other directly, so
+// Tailscale is forced onto a DERP relay — which SLIRP's lossy UDP handling
+// makes flap, breaking tenant->MSSP traffic. We give every VM a *second* NIC on
+// a shared qemu multicast-socket L2 (one broadcast domain per run) with a
+// deterministic static IP, so Tailscale discovers a direct underlay path and
+// the link stays up. All values derive from spec fields — no host bridge, no
+// orchestrator coordination.
+
+func vmHash(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
+
+// lanHubPort is the host TCP port the run's inter-VM L2 hub listens on: shared
+// by every VM in a run (derived from RunID) yet distinct across concurrent runs.
+func lanHubPort(runID string) int {
+	return 20000 + int(vmHash(runID)%40000)
+}
+
+// lanNetdev is the qemu -netdev spec for the inter-VM LAN. The MSSP hosts the
+// L2 as a qemu socket hub (listen); every other VM connects to it over the host
+// loopback. A single-host TCP hub is reliable, unlike socket multicast, which
+// qemu won't loop between sibling VMs on many hosts. The MSSP is always
+// provisioned before tenants, so the listener is up before anyone connects.
+func lanNetdev(role, runID string) string {
+	if role == "mssp" {
+		return fmt.Sprintf("socket,id=lan0,listen=:%d", lanHubPort(runID))
+	}
+	return fmt.Sprintf("socket,id=lan0,connect=127.0.0.1:%d", lanHubPort(runID))
+}
+
+// wanMAC / lanMAC are per-VM and stable. 52:54:00 is qemu's OUI; the LAN NIC
+// uses a distinct 52:54:01 prefix so the network-config matches each NIC
+// unambiguously by MAC (interface renaming is then irrelevant).
+func wanMAC(vmKey string) string {
+	h := vmHash("wan:" + vmKey)
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", byte(h>>16), byte(h>>8), byte(h))
+}
+func lanMAC(vmKey string) string {
+	h := vmHash("lan:" + vmKey)
+	return fmt.Sprintf("52:54:01:%02x:%02x:%02x", byte(h>>16), byte(h>>8), byte(h))
+}
+
+// lanIPv4 is a per-VM address on the shared 10.99.0.0/16 L2. The ~64k-host
+// space makes a collision negligible for the handful of VMs in a run.
+func lanIPv4(vmKey string) string {
+	h := vmHash("ip:" + vmKey)
+	return fmt.Sprintf("10.99.%d.%d", byte(h>>8), byte(h)%254+1)
+}
+
+// networkConfig is the NoCloud netplan-v2 doc baked into the seed ISO: the WAN
+// NIC keeps DHCP (internet via SLIRP), the LAN NIC gets the static /16 that
+// Tailscale uses as a direct path to the run's other VMs.
+func networkConfig(vmKey string) string {
+	return fmt.Sprintf(`version: 2
+ethernets:
+  wan0:
+    match: {macaddress: %s}
+    set-name: wan0
+    dhcp4: true
+  lan0:
+    match: {macaddress: %s}
+    set-name: lan0
+    dhcp4: false
+    optional: true
+    addresses: [%s/16]
+`, wanMAC(vmKey), lanMAC(vmKey), lanIPv4(vmKey))
+}
 
 // provider holds the plugin's mutable state for the lifetime of the process.
 // tsAPIKey is the Tailscale API key, set once in initialize. imageCache
@@ -275,18 +350,23 @@ func (p *provider) create(ctx context.Context, params sdk.VMCreateParams, emit s
 		ExtraUserData: spec.UserData,
 	})
 	metaData := fmt.Sprintf("instance-id: lp-%s\nlocal-hostname: %s\n", spec.VMKey, hostname)
+	netData := networkConfig(spec.VMKey)
 
-	// Upload user-data and meta-data.
-	emit.Progress("cloud_init", 35, "writing user-data + meta-data")
+	// Upload user-data, meta-data, and network-config.
+	emit.Progress("cloud_init", 35, "writing user-data + meta-data + network-config")
 	if err := sshhost.WriteFile(p.sshClient, work+"/user-data", []byte(userData)); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 	if err := sshhost.WriteFile(p.sshClient, work+"/meta-data", []byte(metaData)); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
-	// Build seed.iso on the host.
+	if err := sshhost.WriteFile(p.sshClient, work+"/network-config", []byte(netData)); err != nil {
+		return sdk.VMCreateResult{}, err
+	}
+	// Build seed.iso on the host. network-config is picked up by the NoCloud
+	// datasource to configure both NICs (WAN via DHCP, LAN static).
 	if _, err := sshhost.Run(ctx, p.sshClient,
-		"cd "+sshhost.ShellEscape(work)+" && genisoimage -output seed.iso -volid cidata -joliet -rock user-data meta-data"); err != nil {
+		"cd "+sshhost.ShellEscape(work)+" && genisoimage -output seed.iso -volid cidata -joliet -rock user-data meta-data network-config"); err != nil {
 		return sdk.VMCreateResult{}, err
 	}
 
@@ -301,9 +381,12 @@ func (p *provider) create(ctx context.Context, params sdk.VMCreateParams, emit s
 
 	// Launch QEMU.
 	//
-	// Networking: user-mode (SLIRP) NAT so the guest reaches the internet to
-	// download Tailscale + do apt. No hostfwd needed — Tailscale becomes the
-	// overlay for anything that needs to reach the VM.
+	// Networking: NIC 0 is user-mode (SLIRP) NAT so the guest reaches the
+	// internet to download Tailscale + do apt. NIC 1 is a per-run inter-VM L2
+	// (qemu socket hub, hosted by the MSSP) so a run's VMs have a direct
+	// underlay path to each other — SLIRP alone leaves them isolated, forcing
+	// Tailscale onto a flapping DERP relay. Both NICs carry explicit MACs the
+	// seed's network-config matches on.
 	emit.Progress("boot", 75, "spawning qemu")
 	launch := fmt.Sprintf(`nohup qemu-system-x86_64 \
   -enable-kvm -machine q35 -cpu host \
@@ -311,13 +394,17 @@ func (p *provider) create(ctx context.Context, params sdk.VMCreateParams, emit s
   -drive file=%s/disk.qcow2,format=qcow2,if=virtio \
   -drive file=%s/seed.iso,format=raw,if=virtio,readonly=on \
   -netdev user,id=net0 \
-  -device virtio-net,netdev=net0 \
+  -device virtio-net,netdev=net0,mac=%s \
+  -netdev %s \
+  -device virtio-net,netdev=lan0,mac=%s \
   -serial file:%s/serial.log \
   -display none \
   -pidfile %s \
   -daemonize > %s/nohup.out 2>&1`,
 		p.cfg.MemoryMB, p.cfg.CPU,
-		sshhost.ShellEscape(work), sshhost.ShellEscape(work), sshhost.ShellEscape(work),
+		sshhost.ShellEscape(work), sshhost.ShellEscape(work),
+		wanMAC(spec.VMKey), lanNetdev(spec.Tags["role"], spec.RunID), lanMAC(spec.VMKey),
+		sshhost.ShellEscape(work),
 		sshhost.ShellEscape(pidPath), sshhost.ShellEscape(work),
 	)
 	if _, err := sshhost.Run(ctx, p.sshClient, launch); err != nil {
