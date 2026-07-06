@@ -289,12 +289,30 @@ func (o *Orchestrator) installMSSP(ctx context.Context, user, sshTarget, hostnam
 		llmKey = "sk-launchpad-smoke-placeholder"
 	}
 
+	// Tenant SOC pods (adapter + runs-worker) can't resolve the MSSP hostname
+	// from inside the tenant cluster's DNS — Tailscale MagicDNS isn't reachable
+	// from pod netns. Hand install.sh the MSSP's own tailnet IP → hostname
+	// mapping (sshTarget IS the resolved tailnet IP). install.sh threads it into
+	// the soctalk-system chart as tenantProvisioning.l1HostAliases; at
+	// :issue-agent time the MSSP emits it as the tenant chart's
+	// soctalkSystem.hostAliases, which lands in the adapter/runs-worker
+	// /etc/hosts so they can reach SOCTALK_API_URL. Format is the ip=host pair
+	// the MSSP's agent-provisioning parser expects (semicolon-separated pairs,
+	// comma-separated hostnames).
+	l1HostAliases := fmt.Sprintf("%s=%s", sshTarget, hostname)
+
 	script := fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
 export SOCTALK_MSSP_NAME=%q
 export SOCTALK_ADMIN_EMAIL=%q
 export SOCTALK_ADMIN_PASSWORD=%q
 export SOCTALK_HOSTNAME=%q
+export SOCTALK_L1_HOST_ALIASES=%q
+# The launchpad MSSP serves a self-signed cert (launchpad-owned certs pending),
+# so tenant adapters must skip TLS verification when reaching back to L1 to
+# heartbeat + forward alerts. Threaded to the api pod -> each tenant install's
+# soctalkSystem.verifySsl -> the adapter's SOCTALK_API_VERIFY_SSL.
+export SOCTALK_L1_VERIFY_SSL=false
 export SOCTALK_LLM_PROVIDER=%q
 export SOCTALK_LLM_API_KEY=%q
 # install.sh writes an empty tenantProvisioning: block when no SOCTALK_TENANT_*
@@ -312,6 +330,7 @@ curl -sfL %s | sudo -E bash -s -- --demo
 		icfg.MSSPAdminEmail,
 		icfg.MSSPAdminPassword,
 		hostname,
+		l1HostAliases,
 		llmProvider,
 		llmKey,
 		installerURL,
