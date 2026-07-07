@@ -323,6 +323,10 @@ export SOCTALK_LLM_API_KEY=%q
 export SOCTALK_TENANT_CHART_REF=oci://ghcr.io/soctalk/charts/soctalk-tenant
 export SOCTALK_AGENT_CHART_REF=oci://ghcr.io/soctalk/charts/soctalk-cloud-agent
 export SOCTALK_ASSUME_YES=true
+# The launchpad onboards its own real tenants, so suppress install.sh --demo's
+# throwaway 'demo' tenant — the MSSP tenants list should show only what the
+# operator provisioned.
+export SOCTALK_ONBOARD_DEMO=false
 # Wait for cloud-init + tailscale-up to fully settle before we start.
 cloud-init status --wait >/dev/null 2>&1 || true
 curl -sfL %s | sudo -E bash -s -- --demo
