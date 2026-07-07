@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -669,10 +670,18 @@ func (o *Orchestrator) captureRemote(ctx context.Context, user, host, script str
 	return string(out), nil
 }
 
+// ansiEscape matches ANSI escape sequences (CSI: colours, cursor moves, etc.).
+// Remote tools colour their output; without a TTY those codes arrive as raw
+// bytes and render as literal `[32m` garbage in the web console's event log.
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
 func (o *Orchestrator) streamLines(vmKey, level string, r io.Reader) {
 	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 64*1024), 1024*1024)
 	for s.Scan() {
-		o.emit(Event{Ev: EvVMLog, VMKey: vmKey, Level: level, Message: s.Text()})
+		// Strip ANSI escapes and stray carriage returns so the event log is
+		// clean text regardless of what the remote tool emits.
+		msg := ansiEscape.ReplaceAllString(strings.TrimRight(s.Text(), "\r"), "")
+		o.emit(Event{Ev: EvVMLog, VMKey: vmKey, Level: level, Message: msg})
 	}
 }
