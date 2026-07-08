@@ -23,6 +23,7 @@ type RunRequest struct {
 	MSSPHost string                     `json:"mssp_host"` // host name for the MSSP
 	Tenants  []tenantPlacement          `json:"tenants"`
 	Install  orchestrator.InstallConfig `json:"install"`
+	Recreate bool                       `json:"recreate"` // tear down existing VMs first, then rebuild fresh
 }
 
 type tenantPlacement struct {
@@ -45,6 +46,16 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "compose_failed", err.Error())
 		return
+	}
+	// Recreate = fresh install: destroy any existing VMs for this run and clear
+	// its state before starting, so this is a rebuild rather than an idempotent
+	// reconcile. Done here (start-time) because the install secrets live in the
+	// request, not the redacted run snapshot.
+	if req.Recreate {
+		if err := s.Mgr.RecreateTeardown(cfg, extraEnv); err != nil {
+			writeErr(w, http.StatusConflict, "recreate_failed", err.Error())
+			return
+		}
 	}
 	run, err := s.Mgr.Start(cfg, extraEnv)
 	if err != nil {

@@ -7,6 +7,7 @@ package runmanager
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -327,6 +328,54 @@ func (m *Manager) Down(runID string) error {
 		r.endedAt = time.Now().UTC()
 		r.mu.Unlock()
 	}()
+	return nil
+}
+
+// RecreateTeardown synchronously destroys any VMs recorded for cfg.RunID and
+// clears its state, so a following Start rebuilds from scratch — the console's
+// "recreate (fresh install)" path. Works from the on-disk state (the run need
+// not be live in this process). A no-op when there is nothing to tear down.
+// The shared base-image cache is untouched, so re-provisioning stays fast.
+func (m *Manager) RecreateTeardown(cfg orchestrator.Config, extraEnv map[string][]string) error {
+	if r, ok := m.Get(cfg.RunID); ok {
+		r.mu.Lock()
+		st := r.status
+		r.mu.Unlock()
+		if st == StatusRunning || st == StatusCancelling || st == StatusTearingDown {
+			return fmt.Errorf("run %q is %s; cancel it before recreating", cfg.RunID, st)
+		}
+	}
+	manifests, err := targetresolver.Resolve(cfg)
+	if err != nil {
+		return err
+	}
+	statePath := filepath.Join(m.dir, cfg.RunID+".json")
+	state, err := orchestrator.LoadOrInit(statePath, cfg.RunID, cfg.Target)
+	if err != nil {
+		return err
+	}
+	// Reverse teardown order: tenants first, MSSP last.
+	order := make([]orchestrator.VMSpec, 0, len(cfg.Tenants)+1)
+	for i := len(cfg.Tenants) - 1; i >= 0; i-- {
+		order = append(order, cfg.Tenants[i])
+	}
+	order = append(order, cfg.MSSP)
+
+	events := make(chan orchestrator.Event, 256)
+	errCh := make(chan error, 1)
+	d := &orchestrator.DownContext{Cfg: cfg, Manifests: manifests, State: state, Order: order, ExtraEnv: extraEnv}
+	go func() { errCh <- d.Run(context.Background(), events) }() // closes events
+	for range events {                                          // drain (no journal yet)
+	}
+	if err := <-errCh; err != nil {
+		return err
+	}
+	// Clear state + any stale run object so Start begins from a clean slate.
+	_ = os.Remove(statePath)
+	m.mu.Lock()
+	delete(m.runs, cfg.RunID)
+	delete(m.phases, cfg.RunID)
+	m.mu.Unlock()
 	return nil
 }
 

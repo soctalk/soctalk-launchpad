@@ -135,6 +135,7 @@ export interface RunRequest {
 	mssp_host: string;
 	tenants: TenantPlacement[];
 	install: Record<string, unknown>;
+	recreate?: boolean;
 }
 
 export const api = {

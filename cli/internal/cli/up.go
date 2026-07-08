@@ -25,6 +25,7 @@ type UpOptions struct {
 	StatePath        string
 	Headless         bool // true → JSON events on stdout, commands on stdin
 	AutoResolveGates bool // true → auto-resolve every gate (for scripted smoke tests)
+	Recreate         bool // true → tear down existing VMs first, then rebuild fresh
 }
 
 // Up is the entry point for `launchpad up`.
@@ -45,6 +46,22 @@ func Up(opts UpOptions) error {
 	if opts.StatePath == "" {
 		opts.StatePath = filepath.Join(defaultStateDir(), cfg.RunID+".json")
 	}
+
+	// --recreate: destroy any existing VMs for this run first so `up` rebuilds
+	// from scratch — a genuine fresh install rather than an idempotent
+	// reconcile. Reuses `down` (which removes the state file); the shared
+	// base-image cache (work_dir/_images) is untouched, so provisioning stays
+	// fast. A no-op on a first run (nothing to tear down).
+	if opts.Recreate {
+		if err := Down(DownOptions{
+			ConfigPath: opts.ConfigPath,
+			StatePath:  opts.StatePath,
+			Headless:   opts.Headless,
+		}); err != nil {
+			return fmt.Errorf("recreate: teardown failed: %w", err)
+		}
+	}
+
 	state, err := orchestrator.LoadOrInit(opts.StatePath, cfg.RunID, cfg.Target)
 	if err != nil {
 		return fmt.Errorf("state: %w", err)

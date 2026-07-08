@@ -80,6 +80,8 @@ func upCmd(args []string) {
 			opts.Headless = true
 		case "--auto-resolve-gates":
 			opts.AutoResolveGates = true
+		case "--recreate", "--fresh":
+			opts.Recreate = true
 		default:
 			fmt.Fprintln(os.Stderr, "unknown flag:", args[i])
 			os.Exit(2)
@@ -87,7 +89,7 @@ func upCmd(args []string) {
 		i++
 	}
 	if opts.ConfigPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: launchpad up --config PATH [--state PATH] [--headless] [--auto-resolve-gates]")
+		fmt.Fprintln(os.Stderr, "usage: launchpad up --config PATH [--state PATH] [--headless] [--auto-resolve-gates] [--recreate]")
 		os.Exit(2)
 	}
 	ensurePluginsSynced()
@@ -174,6 +176,8 @@ Commands:
   up --config PATH                orchestrate a rollout (MSSP + tenants)
                                   --headless emits JSON events on stdout
                                   --auto-resolve-gates auto-confirms every gate
+                                  --recreate tears down existing VMs first, then
+                                  rebuilds fresh (base-image cache kept)
   down --config PATH              tear down every VM in state (via vm.destroy)
                                   --headless emits JSON events on stdout
                                   --keep-state leave the state file in place

@@ -22,6 +22,13 @@
 
 	let launching = false;
 	let launchError = '';
+	// recreate = fresh install: tear down any existing VMs for this run before
+	// starting, instead of an idempotent reconcile of what's already there.
+	let recreate = false;
+	// runName = stable run id. Blank → a fresh timestamped id each launch (every
+	// run is independent). Set it (or Re-run an existing run) to reuse an id, so
+	// a plain launch reconciles that stack and Recreate tears it down + rebuilds.
+	let runName = '';
 
 	onMount(async () => {
 		try {
@@ -62,13 +69,43 @@
 	$: formReady =
 		hosts.length > 0 && networks.length > 0 && !!msspHost && !!network && tenants.every((t) => t.slug && t.host);
 
+	// hostFromTarget extracts the host name from a composed plugin target
+	// ("platform@host" → "host"); a bare target with no separator is returned
+	// as-is. Used by Re-run to map a saved run's targets back to host names.
+	const hostFromTarget = (t: string) => (t && t.includes('@') ? t.slice(t.indexOf('@') + 1) : t);
+
+	// reRun pre-fills the form from a saved run so a relaunch reuses its run_id.
+	// Recreate is turned on by default because re-running an existing stack is
+	// almost always meant to rebuild it fresh (teardown + provision). Install
+	// secrets are never persisted, so those fields keep the form's current values.
+	function reRun(run: RunSnapshot) {
+		const cfg = (run.config ?? {}) as Record<string, any>;
+		runName = run.id;
+		recreate = true;
+		if (typeof cfg.target === 'string') {
+			const h = hostFromTarget(cfg.target);
+			if (hostByName(h)) msspHost = h;
+		}
+		if (Array.isArray(cfg.tenants) && cfg.tenants.length) {
+			tenants = cfg.tenants.map((t: any) => ({
+				slug: t.tenant_slug ?? t.slug ?? 'tenant',
+				host: hostByName(hostFromTarget(t.target ?? cfg.target)) ? hostFromTarget(t.target ?? cfg.target) : msspHost,
+			}));
+		}
+		const tailnet = cfg.plugin_config?.tailnet;
+		const net = networks.find((n) => n.tailnet === tailnet);
+		if (net) network = net.name;
+		// bring the form into view for confirmation before launching.
+		if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' });
+	}
+
 	async function launch() {
 		launching = true;
 		launchError = '';
 		// Reference-based run request. The server resolves hosts and network into
 		// the full config and injects secrets, so nothing sensitive leaves the browser.
 		const req = {
-			run_id: `web-${Date.now()}`,
+			run_id: runName.trim() || `web-${Date.now()}`,
 			network,
 			mssp_host: msspHost,
 			tenants: tenants.map((t) => ({ slug: t.slug, host: t.host })),
@@ -79,6 +116,7 @@
 				llm_provider: llmProvider,
 				llm_api_key: llmKey,
 			},
+			recreate,
 		};
 		try {
 			const { run_id } = await api.startRun(req);
@@ -143,12 +181,30 @@
 				>
 			</div>
 
-			<div class="mt-4">
-				<label class="field-label" for="network">network</label>
-				<select id="network" class="field-input" data-testid="network" bind:value={network}>
-					{#each networks as n}<option value={n.name}>{n.name} · {n.tailnet}</option>{/each}
-				</select>
+			<div class="mt-4 grid grid-cols-2 gap-3">
+				<div>
+					<label class="field-label" for="network">network</label>
+					<select id="network" class="field-input" data-testid="network" bind:value={network}>
+						{#each networks as n}<option value={n.name}>{n.name} · {n.tailnet}</option>{/each}
+					</select>
+				</div>
+				<div>
+					<label class="field-label" for="run-name">run name <span class="text-slate-500">(optional)</span></label>
+					<input
+						id="run-name"
+						class="field-input"
+						data-testid="run-name"
+						bind:value={runName}
+						placeholder="auto — fresh run each launch"
+					/>
+				</div>
 			</div>
+			{#if runName.trim()}
+				<p class="mt-1 text-xs text-slate-500">
+					Reusing id <span class="font-mono text-slate-400">{runName.trim()}</span> — a plain launch reconciles this
+					stack; tick Recreate to tear it down and rebuild.
+				</p>
+			{/if}
 
 			<details class="mt-4">
 				<summary class="text-sm text-slate-400 cursor-pointer select-none">Install settings</summary>
@@ -176,9 +232,14 @@
 				</div>
 			</details>
 
+			<label class="mt-4 flex items-center gap-2 text-sm text-slate-300 select-none cursor-pointer">
+				<input type="checkbox" data-testid="recreate" bind:checked={recreate} />
+				Recreate (fresh install) — tear down existing VMs first, then rebuild
+			</label>
+
 			<div class="mt-5 flex items-center gap-4">
 				<button class="btn-primary" data-testid="launch" disabled={launching || !formReady} on:click={launch}>
-					{launching ? 'Launching…' : 'Launch'}
+					{launching ? (recreate ? 'Recreating…' : 'Launching…') : recreate ? 'Recreate' : 'Launch'}
 				</button>
 				<span class="text-xs text-slate-500 truncate" data-testid="preview-ribbon">{preview}</span>
 			</div>
@@ -191,7 +252,7 @@
 			<h3 class="text-sm uppercase tracking-wide text-slate-400 mb-3">Recent runs</h3>
 			<div class="grid gap-2" data-testid="recent-runs">
 				{#each runs as run}
-					<a href={`/runs/${run.id}`} class="card !p-3 flex items-center gap-4 hover:border-accent-500">
+					<div class="card !p-3 flex items-center gap-4">
 						<span
 							class="text-xs px-2 py-0.5 rounded-full {run.status === 'complete'
 								? 'bg-emerald-900 text-emerald-300'
@@ -199,9 +260,14 @@
 									? 'bg-red-900 text-red-300'
 									: 'bg-surface-600 text-slate-300'}">{run.status}</span
 						>
-						<span class="font-mono text-sm">{run.id}</span>
+						<a href={`/runs/${run.id}`} class="font-mono text-sm hover:text-accent-400">{run.id}</a>
 						<span class="text-xs text-slate-500 ml-auto">{run.phase}</span>
-					</a>
+						<button
+							class="text-xs text-accent-400 hover:text-accent-300 border border-surface-600 rounded px-2 py-1"
+							data-testid={"rerun-" + run.id}
+							on:click={() => reRun(run)}>Re-run</button
+						>
+					</div>
 				{/each}
 			</div>
 		</section>
