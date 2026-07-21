@@ -30,7 +30,11 @@ import (
 )
 
 const (
-	defaultInstallerURL = "https://raw.githubusercontent.com/soctalk/soctalk/main/install.sh"
+	// Pinned to the soctalk v0.2.0 tag so this launchpad release reproducibly
+	// installs SocTalk 0.2.0 (chart 0.2.0 + images :0.2.0, both carrying the
+	// v0.2.0 fixes). Bump this in lockstep when cutting a launchpad release
+	// for a newer SocTalk version. Overridable via InstallConfig.InstallerURL.
+	defaultInstallerURL = "https://raw.githubusercontent.com/soctalk/soctalk/v0.2.0/install.sh"
 	defaultSSHUser      = "ops"
 )
 
